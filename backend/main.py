@@ -562,9 +562,11 @@ def web_search(pid, query=None, image_b64=None):
     body = {"query": query} if query else {"base64_image": image_b64}
     try:
         res = httpx.post("https://api.trychannel3.com/v1/search", headers={"x-api-key": key}, json=body, timeout=30)
-    except httpx.HTTPError:
+    except httpx.HTTPError as e:
+        logging.warning("Channel3 search failed to connect: %s", type(e).__name__)
         raise HTTPException(502, "Product search failed")
     if res.status_code >= 400:
+        logging.warning("Channel3 search returned %s: %s", res.status_code, res.text[:300])  # 401/403 = key problem, 429 = quota
         raise HTTPException(502, "Product search failed")
     out = []
     ctx = load_ctx(pid)
@@ -648,7 +650,8 @@ def run_agent(pid, message, history=None, image_b64=None):
     for _ in range(6):
         try:
             res = ai.messages.create(model=gemini.model_name(), max_tokens=700, system=system, tools=tools, messages=msgs)
-        except gemini.APIError:
+        except gemini.APIError as e:
+            logging.warning("Penny: the Gemini call failed: %s", str(e)[:400])  # so the Render logs say why (quota, bad model name, blocked request)
             raise HTTPException(502, "Penny is unavailable right now. Try again soon.")
         if res.stop_reason != "tool_use":
             text = "".join(b.text for b in res.content if b.type == "text").strip()
