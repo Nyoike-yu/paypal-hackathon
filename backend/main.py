@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import date
 from decimal import Decimal, ROUND_DOWN
 from typing import Literal
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote_plus, urlencode, urlparse
 import httpx, psycopg, gemini
 from psycopg.rows import dict_row
 from dotenv import load_dotenv
@@ -568,15 +568,44 @@ def web_search(pid, query=None, image_b64=None):
     if res.status_code >= 400:
         logging.warning("Channel3 search returned %s: %s", res.status_code, res.text[:300])  # 401/403 = key problem, 429 = quota
         raise HTTPException(502, "Product search failed")
-    out = []
-    ctx = load_ctx(pid)
-    for p in res.json().get("products", [])[:5]:
-        offers = [o for o in p.get("offers", []) if o.get("price") and o.get("availability", "InStock") == "InStock"]
-        if not offers: continue
-        o = min(offers, key=lambda o: o["price"]["amount"])
-        verdict, why = judge(ctx, o["price"]["amount"], o["domain"], False)
-        with _lock: OFFERS[(pid, o["url"])] = {"title": p.get("title"), "store": o["domain"], "price": o["price"]["amount"]}
-        out.append({"title": p.get("title"), "store": o["domain"], "price": o["price"]["amount"], "url": o["url"], "image": product_image(p), "verdict": verdict, "why": why, "checks": judge_checks(ctx, o["price"]["amount"], o["domain"], False)})
+    out, bad, ctx = [], None, load_ctx(pid)
+    try: data = res.json()
+    except ValueError: data = None
+    items = (data.get("products") if isinstance(data, dict) else data) or []
+    for p in items[:5]:
+        try:
+            offers = [o for o in p.get("offers") or [] if _offer_price(o) is not None and str(o.get("availability", "InStock")).replace("_", "").lower() in ("instock", "limitedavailability")]
+            if not offers: continue
+            o = min(offers, key=_offer_price)
+            price, store = _offer_price(o), o.get("domain") or o.get("merchant_domain")
+            if not store or not o.get("url"): raise KeyError("domain or url")
+            verdict, why = judge(ctx, price, store, False)
+            with _lock: OFFERS[(pid, o["url"])] = {"title": p.get("title"), "store": store, "price": price}
+            out.append({"title": p.get("title"), "store": store, "price": price, "url": o["url"], "image": product_image(p), "verdict": verdict, "why": why, "checks": judge_checks(ctx, price, store, False)})
+        except (KeyError, TypeError, ValueError, ArithmeticError, AttributeError):
+            bad = bad or p  # Channel3 sent something shaped differently from what we expect
+    if bad is not None and not out:
+        logging.warning("Channel3 products we couldn't read. First one: %s", json.dumps(bad, default=str)[:700])  # paste this line if search still fails
+    return out
+
+def _offer_price(o):
+    """An offer's price as a number. Channel3's docs show {"price": {"amount": 9}}, {"price": {"price": 9}} and a bare number, so all three work. None if there isn't one."""
+    v = o.get("price") if isinstance(o, dict) else None
+    if isinstance(v, dict): v = v.get("amount", v.get("price"))
+    try: return float(v) if v is not None else None
+    except (TypeError, ValueError): return None
+
+# Backup when the live price search fails or finds nothing: links that open each store's own search page. Built by code from this list, never
+# written by the model, so they can't be made up. Add or remove stores here (use {q} where the search words go).
+STORE_LINKS = [("Jumia", "https://www.jumia.co.ke/catalog/?q={q}"), ("Kilimall", "https://www.kilimall.co.ke/search?q={q}"), ("Amazon", "https://www.amazon.com/s?k={q}"),
+               ("Best Buy", "https://www.bestbuy.com/site/searchpage.jsp?st={q}"), ("eBay", "https://www.ebay.com/sch/i.html?_nkw={q}")]
+
+def store_links(pid, term):
+    words, out = quote_plus(term), []
+    for name, tpl in STORE_LINKS:
+        url = tpl.format(q=words)
+        with _lock: OFFERS[(pid, url)] = {"title": term, "store": name, "price": None}
+        out.append({"title": term, "store": name, "url": url, "link_only": True})
     return out
 
 # ---------- Penny's memory ----------
@@ -672,9 +701,18 @@ def run_agent(pid, message, history=None, image_b64=None):
                     for x in result: OFFERED[(pid, x["id"])] = x["price"]  # the price the person was shown
                     trace.append(f'Searched partner stores for "{term}": {len(result)} result(s)')
                 elif b.name == "search_stores":
-                    found = web_search(pid, query=term); picks = found[:3]
-                    result = [{k: o[k] for k in ("title", "store", "price", "verdict")} for o in found]
-                    trace.append(f'Searched other stores for "{term}": {len(found)} result(s)' + (f", cheapest ${min(o['price'] for o in found):.2f}" if found else ""))
+                    try: found = web_search(pid, query=term)
+                    except HTTPException as e:
+                        logging.warning("search_stores fell back to store links: %s", e.detail); found = []
+                    if found:
+                        picks = found[:3]
+                        result = [{k: o[k] for k in ("title", "store", "price", "verdict")} for o in found]
+                        trace.append(f'Searched other stores for "{term}": {len(found)} result(s), cheapest ${min(o["price"] for o in found):.2f}')
+                    else:
+                        picks = store_links(pid, term)
+                        result = {"note": "Live prices aren't available right now, so the app is showing links that open each store's own search. No prices are known: say so in one sentence and don't invent any.",
+                                  "stores": [x["store"] for x in picks]}
+                        trace.append(f'Live search gave nothing for "{term}", so showed {len(picks)} store search links')
                 elif b.name == "buy":
                     prod_id = int(inp["product_id"])
                     if (pid, prod_id) not in OFFERED: raise HTTPException(409, "Search for the item first, then confirm it with the person.")
@@ -885,6 +923,9 @@ def open_link(l: Link, uid: int = Depends(current_user)):
     own(uid, l.profile_id)
     with _lock: o = OFFERS.get((uid, l.url))
     if not o: raise HTTPException(404, "Search for this item first.")
+    if o.get("price") is None:  # a link to a store's own search page: there is no price to check and nothing is bought here
+        log(uid, "link", f"Opened {o['store']} to look for {o['title']}")
+        return {"status": "open", "url": l.url}
     verdict, why = check_rules(uid, o, partner=False)
     if verdict == "ok":
         log(uid, "link", f"Opened {o['title']} at {o['store']} (${o['price']:.2f})")

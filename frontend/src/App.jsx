@@ -58,6 +58,13 @@ const Empty = ({ text, mood = "happy" }) => <div className="empty"><Piggy small 
 const imgOf = o => o.image || o.image_url || (Array.isArray(o.images) && o.images[0]) || null;
 function Pick({ o, open }) {
   const [bad, setBad] = useState(false), src = imgOf(o), ok = o.verdict === "ok", label = { ok: "Within limits", needs_approval: "Needs approval" }[o.verdict] || "Blocked";
+  if (o.link_only) return (  // a backup link to a store's own search page: no price, no rules check
+    <div className="pick2">
+      <div className="shot"><span aria-hidden="true">{o.store[0]}</span></div>
+      <b className="pt">{o.store}</b><span className="mute">Search there</span>
+      <button className="alt wide" onClick={() => open(o)}>Open</button>
+    </div>
+  );
   return (
     <div className="pick2">
       <div className={"shot" + (ok ? "" : " dim")}>{src && !bad ? <img src={src} alt="" loading="lazy" onError={() => setBad(true)} /> : <span aria-hidden="true">{o.emoji || (o.title || "?")[0]}</span>}</div>
