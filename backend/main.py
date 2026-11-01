@@ -150,6 +150,9 @@ def sweep_all():
     tidy()
     return n
 
+MAX_GOALS = 20  # per child; a guard against a runaway loop, not a limit anyone should meet
+_gkey = lambda t: " ".join(str(t).split()).casefold()  # goal names match ignoring case and extra spaces
+
 def create_goal(child_id, name, target, by, percent=0, product_id=None):
     name = str(name).strip()
     if not name or len(name) > 60: raise HTTPException(422, "Give the goal a short name.")
@@ -158,11 +161,12 @@ def create_goal(child_id, name, target, by, percent=0, product_id=None):
     pct = int(percent) if by != child_id else 0  # only a grown-up adds a bonus, and it's optional
     watch = q("select id, price from products where id=%s", (product_id,), one=True) if product_id else None
     if product_id and not watch: raise HTTPException(422, "Unknown item.")
-    try:  # the unique index allows one goal in progress per child
+    with plock(child_id):  # a child can have many goals, but not two with the same name (and not an endless pile)
+        mine = q("select name from goals where child_id=%s and status in ('active','paying')", (child_id,))
+        if any(_gkey(m["name"]) == _gkey(name) for m in mine): raise HTTPException(409, f"There's already a goal called {name}.")
+        if len(mine) >= MAX_GOALS: raise HTTPException(409, f"That's {MAX_GOALS} goals already. Finish or cancel one before adding another.")
         g = q("insert into goals(child_id,name,target,created_by,bonus_pct,watch_product_id,watch_price) values(%s,%s,%s,%s,%s,%s,%s) returning id",
               (child_id, name, t, by, pct, watch and watch["id"], watch and watch["price"]), one=True)
-    except psycopg.errors.UniqueViolation:
-        raise HTTPException(409, "There's already a goal in progress.")
     c = q("select name, guardian_id from profiles where id=%s", (child_id,), one=True)
     log(child_id, "goal", f"Goal: {name}, ${t:.2f}")
     if by == child_id and c["guardian_id"]:
@@ -171,12 +175,43 @@ def create_goal(child_id, name, target, by, percent=0, product_id=None):
         notify(child_id, "A new goal", f"A grown-up set a goal for you: {name}, ${t:.2f}." + (f" Reach it for a {pct}% bonus." if pct else ""), "Move money from your wallet whenever you like.", g["id"])
     return {"id": g["id"], "name": name, "target": float(t)}
 
-def deposit(pid, amount):
+def bonus_on_existing(child_id, name, percent):
+    """If `name` is one of the child's goals (same words, ignoring case and extra spaces), set that goal's bonus and return it.
+    Returns None when no goal has that name, so the caller starts a new goal. Target and saved money are never touched here."""
+    with plock(child_id):  # same lock as deposits, so the goal can't reach its target halfway through
+        g = next((x for x in q("select id, name, target, bonus_pct, status from goals where child_id=%s and status in ('active','paying') order by id", (child_id,)) if _gkey(x["name"]) == _gkey(name)), None)
+        if not g: return None
+        if g["status"] != "active": raise HTTPException(409, f"{g['name']} is already reached. Its bonus is being paid, so it can't change now.")
+        pct = int(percent)
+        q("update goals set bonus_pct=%s where id=%s and status='active'", (pct, g["id"]))
+    if pct != int(g["bonus_pct"]):
+        log(child_id, "goal", f"Bonus on {g['name']} is now {pct}%")
+        notify(child_id, "Your bonus changed", (f"Reach {g['name']} and get a {pct}% bonus." if pct else f"There's no bonus on {g['name']} right now. It's still your goal."), "Move money from your wallet whenever you like.", g["id"])
+    return {"id": g["id"], "name": g["name"], "target": float(g["target"]), "bonus_pct": pct, "updated": True}
+
+def pick_goal(pid, goal_id=None):
+    """The open goal money should move to or from. Several goals and none named is an error that lists them, so nobody guesses."""
+    if goal_id is not None:
+        g = q("select * from goals where id=%s and child_id=%s and status='active'", (goal_id, pid), one=True)
+        if not g: raise HTTPException(404, "That goal isn't open any more.")
+        return g
+    gs = q("select * from goals where child_id=%s and status='active' order by id", (pid,))
+    if not gs: raise HTTPException(409, "Start a goal first.")
+    if len(gs) > 1: raise HTTPException(409, "Which goal? " + ", ".join(x["name"] for x in gs) + ".")
+    return gs[0]
+
+def goal_by_name(pid, name):
+    """The id of the open goal the model named, or None when it named none (pick_goal then decides)."""
+    if not name: return None
+    g = next((x for x in q("select id, name from goals where child_id=%s and status='active'", (pid,)) if _gkey(x["name"]) == _gkey(name)), None)
+    if not g: raise HTTPException(404, f"There's no open goal called {name}.")
+    return g["id"]
+
+def deposit(pid, amount, goal_id=None):
     a = D(amount)
     if a <= 0: raise HTTPException(422, "Pick an amount above zero.")
     with plock(pid):  # serialised with purchases and cancels for this child
-        g = q("select * from goals where child_id=%s and status='active'", (pid,), one=True)
-        if not g: raise HTTPException(409, "Start a goal first.")
+        g = pick_goal(pid, goal_id)
         need = g["target"] - g["saved"]
         if a > need: raise HTTPException(422, f"You only need ${need:.2f} more.")
         if not q("update profiles set balance=balance-%s where id=%s and balance>=%s returning id", (a, pid, a), one=True):
@@ -184,14 +219,14 @@ def deposit(pid, amount):
         q("update goals set saved=saved+%s, last_saved_at=now() where id=%s", (a, g["id"]))
         log(pid, "saved", f"${a:.2f} moved to {g['name']}")
     paid = pay_goal(g["id"])
-    return {"saved": float(g["saved"] + a), "target": float(g["target"]), "reached": g["saved"] + a >= g["target"], "paid": paid}
+    return {"goal_id": g["id"], "name": g["name"], "saved": float(g["saved"] + a), "target": float(g["target"]), "reached": g["saved"] + a >= g["target"], "paid": paid}
 
-def take_back(pid, amount):
+def take_back(pid, amount, goal_id=None):
     a = D(amount)
     if a <= 0: raise HTTPException(422, "Pick an amount above zero.")
     with plock(pid):
-        g = q("update goals set saved=saved-%s where child_id=%s and status='active' and saved>=%s returning name", (a, pid, a), one=True)
-        if not g: raise HTTPException(409, "There isn't that much in savings.")
+        g = pick_goal(pid, goal_id)
+        if not q("update goals set saved=saved-%s where id=%s and status='active' and saved>=%s returning id", (a, g["id"], a), one=True): raise HTTPException(409, "There isn't that much in savings.")
         q("update profiles set balance=balance+%s where id=%s", (a, pid))
         log(pid, "saved", f"${a:.2f} moved back from {g['name']}")
     return {"ok": True}
@@ -430,10 +465,11 @@ def check_watches():
             propose(g["child_id"], g["child_id"], "price_drop", title, body, {"goal_id": g["id"], "new_target": str(new_target), "by": by}, steps)
     return n
 
-def nudge_save(child_id, why):
+def nudge_save(child_id, why, goal_id=None):
     """Suggest moving a slice of the wallet into savings, at most once every 6 days.
     Penny (the model) picks the amount and writes the note; the app caps the amount at half the wallet and falls back to a quarter of it."""
-    g = q("select name, target, saved from goals where child_id=%s and status='active'", (child_id,), one=True)
+    g = (q("select id, name, target, saved from goals where id=%s and child_id=%s and status='active'", (goal_id, child_id), one=True) if goal_id else
+         q("select id, name, target, saved from goals where child_id=%s and status='active' and saved < target order by id limit 1", (child_id,), one=True))
     kid = q("select name, balance from profiles where id=%s", (child_id,), one=True); bal = kid["balance"]
     if not g or recently(child_id, "save", 6): return None
     need = g["target"] - g["saved"]
@@ -445,10 +481,10 @@ def nudge_save(child_id, why):
     if ai:
         amt, title, body, by = Decimal(ai[0]), ai[1], ai[2], "ai"
         steps = why + [f"Wallet is ${bal:.2f} and {g['name']} still needs ${need:.2f}", f"Penny (the AI) suggested ${amt:.0f} and wrote this note. The app keeps it to half the wallet or less"]
-    return propose(child_id, child_id, "save", title, body, {"amount": str(amt), "by": by}, steps)
+    return propose(child_id, child_id, "save", title, body, {"amount": str(amt), "by": by, "goal_id": g["id"]}, steps)
 
 def nudge_stalled():
-    return sum(1 for r in q("select child_id from goals where status='active' and coalesce(last_saved_at, created_at) < now() - interval '7 days'") if nudge_save(r["child_id"], ["You haven't added to this goal for a week"]))
+    return sum(1 for r in q("select id, child_id from goals where status='active' and coalesce(last_saved_at, created_at) < now() - interval '7 days' order by id") if nudge_save(r["child_id"], ["You haven't added to this goal for a week"], r["id"]))
 
 def nudge_limits():
     """Tell a grown-up when a child keeps hitting the per-purchase limit, and suggest a new one based on what they actually tried."""
@@ -488,7 +524,7 @@ def execute_proposal(pr, uid):
         pay_goal(d["goal_id"]); log(pr["child_id"], "goal", f"Goal lowered to ${float(d['new_target']):.2f}")
         return {"ok": True}
     if kind == "save":
-        return deposit(pr["child_id"], d["amount"])
+        return deposit(pr["child_id"], d["amount"], d.get("goal_id"))
     if kind == "raise_limit":
         if not q("update rules set per_purchase_cap=%s where profile_id=%s and profile_id in (select id from profiles where guardian_id=%s) returning profile_id", (D(d["to"]), pr["child_id"], uid), one=True): deny()
         log(pr["child_id"], "rules", f"Per-purchase limit raised to ${float(d['to']):.0f}")
@@ -560,7 +596,7 @@ def tool_note(name, inp, result):
             return [f"Cancelled the order for {safe_title(result.get('item'))}" + (f"; ${float(result['refunded']):.2f} went back to the wallet" if result.get("refunded") else " (nothing had been charged)")]
         if name == "start_mission": return [f"Started the mission \"{safe_title(inp.get('title'))}\" with a ${float(inp['budget']):.2f} budget"]
         if name == "set_goal" and isinstance(result, dict): return [f"Started the savings goal {safe_title(result.get('name'))} (${float(result['target']):.2f})"]
-        if name == "save_money" and isinstance(result, dict): return [f"Moved money into savings: ${result['saved']:.2f} of ${result['target']:.2f}" + (" (goal reached)" if result.get("reached") else "")]
+        if name == "save_money" and isinstance(result, dict): return [f"Moved money into savings for {safe_title(result.get('name'))}: ${result['saved']:.2f} of ${result['target']:.2f}" + (" (goal reached)" if result.get("reached") else "")]
     except Exception:
         logging.exception("couldn't note a tool result")
     return []
@@ -594,7 +630,7 @@ def run_agent(pid, message, history=None, image_b64=None):
     """One chat turn. Returns (reply text, product picks, order, mission ids). The model proposes; the code decides what is allowed."""
     p = q("select * from profiles where id=%s", (pid,), one=True)
     r = q("select * from rules where profile_id=%s", (pid,), one=True)
-    g = q("select name, target, saved, bonus_pct from goals where child_id=%s and status='active'", (pid,), one=True)
+    g = q("select name, target, saved, bonus_pct from goals where child_id=%s and status='active' order by id", (pid,))
     kid = p["role"] == "child"
     past, facts = load_memory(pid) if history is None else ([dict(h) for h in history][-8:], [])  # None: Penny's own saved memory of this chat
     system = agent.build_system(p, r, g, facts)
@@ -674,9 +710,9 @@ def run_agent(pid, message, history=None, image_b64=None):
                     if item is not None and (pid, item) not in OFFERED: raise HTTPException(409, "Search for the item first, then start the goal.")
                     result = create_goal(pid, inp["name"], inp["target"], pid, product_id=item)
                 elif b.name == "save_money" and kid:
-                    result = deposit(pid, inp["amount"])
+                    result = deposit(pid, inp["amount"], goal_by_name(pid, inp.get("goal")))
                 elif b.name == "move_to_wallet" and kid:
-                    result = take_back(pid, inp["amount"])
+                    result = take_back(pid, inp["amount"], goal_by_name(pid, inp.get("goal")))
                 else:
                     result = {"error": "Unknown tool"}
                 if not (isinstance(result, dict) and "error" in result):
@@ -728,8 +764,10 @@ def check_pw(pw, stored):
     return hmac.compare_digest(hashlib.scrypt(pw.encode(), salt=bytes.fromhex(salt), n=2**14, r=8, p=1).hex(), h)
 
 COLS = "p.id,p.name,p.role,p.guardian_id,p.balance,p.coaching,p.frozen,p.interests,p.allowance,p.allowance_next"  # never select the password hash
-GOAL = """(select json_build_object('id',g.id,'name',g.name,'target',g.target,'saved',g.saved,'bonus_pct',g.bonus_pct,'bonus',round(g.target*g.bonus_pct/100,2),'watch',g.watch_product_id,'watch_name',(select name from products where id=g.watch_product_id),'emoji',(select emoji from products where id=g.watch_product_id),'watch_price',g.watch_price,'buy_below',g.buy_below)
-          from goals g where g.child_id=p.id and g.status in ('active','paying')) as goal"""
+_GOALJ = """json_build_object('id',g.id,'name',g.name,'target',g.target,'saved',g.saved,'bonus_pct',g.bonus_pct,'bonus',round(g.target*g.bonus_pct/100,2),'watch',g.watch_product_id,'watch_name',(select name from products where id=g.watch_product_id),'emoji',(select emoji from products where id=g.watch_product_id),'watch_price',g.watch_price,'buy_below',g.buy_below)
+         """
+GOAL = f"""(select {_GOALJ} from goals g where g.child_id=p.id and g.status in ('active','paying') order by g.id limit 1) as goal"""  # the oldest open goal
+GOALS = f"""coalesce((select json_agg({_GOALJ} order by g.id) from goals g where g.child_id=p.id and g.status in ('active','paying')), '[]'::json) as goals"""
 
 # ---------- API ----------
 class Login(BaseModel): name: str; secret: str
@@ -746,7 +784,7 @@ class Interests(BaseModel): interests: list[str] = Field(max_length=10)
 class Rules(BaseModel): per_purchase_cap: float = Field(ge=0, le=10000); weekly_budget: float = Field(ge=0, le=10000); approval_threshold: float = Field(ge=0, le=10000); allowed_stores: list[str] = Field(max_length=20)
 class Topup(BaseModel): guardian_id: int; child_id: int; amount: float = Field(gt=0, le=500)
 class GoalIn(BaseModel): child_id: int; name: str = Field(min_length=1, max_length=60); target: float = Field(gt=0, le=10000); percent: int = Field(default=0, ge=0, le=100)
-class Deposit(BaseModel): profile_id: int; amount: float = Field(gt=0, le=10000)
+class Deposit(BaseModel): profile_id: int; amount: float = Field(gt=0, le=10000); goal_id: int | None = None
 class Bonus(BaseModel): percent: int = Field(ge=0, le=100)
 class Funds(BaseModel): amount: float = Field(gt=0, le=1000)
 class Capture(BaseModel): order_id: str = Field(min_length=3, max_length=64)
@@ -780,12 +818,12 @@ def register(r: Reg, authorization: str = Header(default="")):
 @app.get("/profiles/{pid}")
 def profile(pid: int, uid: int = Depends(current_user)):
     can(uid, pid)
-    return {"profile": q(f"select {COLS}, {GOAL} from profiles p where p.id=%s", (pid,), one=True), "rules": q("select * from rules where profile_id=%s", (pid,), one=True)}
+    return {"profile": q(f"select {COLS}, {GOAL}, {GOALS} from profiles p where p.id=%s", (pid,), one=True), "rules": q("select * from rules where profile_id=%s", (pid,), one=True)}
 
 @app.get("/children/{gid}")
 def children(gid: int, uid: int = Depends(current_user)):
     own(uid, gid)
-    return q(f"select {COLS}, {GOAL} from profiles p where p.guardian_id=%s order by p.id", (gid,))
+    return q(f"select {COLS}, {GOAL}, {GOALS} from profiles p where p.guardian_id=%s order by p.id", (gid,))
 
 @app.get("/products")
 def products(uid: int = Depends(current_user)):
@@ -974,12 +1012,15 @@ def set_allowance(pid: int, a: Allowance, uid: int = Depends(current_user)):
 def new_goal(g: GoalIn, uid: int = Depends(current_user)):
     can(uid, g.child_id)  # the child, or their guardian
     if not q("select 1 from profiles where id=%s and role='child'", (g.child_id,), one=True): raise HTTPException(422, "Goals are for kids.")
+    if uid != g.child_id:  # a grown-up (can() let them through): a name the child already has only sets that goal's bonus; a new name starts another goal
+        same = bonus_on_existing(g.child_id, g.name, g.percent)
+        if same: return same
     return create_goal(g.child_id, g.name, g.target, uid, g.percent)
 
 @app.post("/savings")
 def save_money(d: Deposit, uid: int = Depends(current_user)):
     own(uid, d.profile_id)  # savings are the child's own choice: nobody else moves this money
-    return deposit(uid, d.amount)
+    return deposit(uid, d.amount, d.goal_id)
 
 @app.post("/goals/{gid}/bonus")
 def edit_bonus(gid: int, b: Bonus, uid: int = Depends(current_user)):
@@ -990,7 +1031,7 @@ def edit_bonus(gid: int, b: Bonus, uid: int = Depends(current_user)):
 @app.post("/savings/withdraw")
 def withdraw_savings(d: Deposit, uid: int = Depends(current_user)):
     own(uid, d.profile_id)
-    return take_back(uid, d.amount)
+    return take_back(uid, d.amount, d.goal_id)
 
 def credit_order(oid, uid=None):
     """Capture an approved PayPal order exactly once and add its money to the guardian's balance. Safe to call twice."""

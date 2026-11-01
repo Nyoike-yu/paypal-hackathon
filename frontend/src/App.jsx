@@ -250,7 +250,7 @@ function MoveSheet({ me, p, g, start, onClose, refresh, say, onCoin }) {
   const [dir, setDir] = useState(start), [amt, setAmt] = useState(""), [err, setErr] = useState("");
   const need = g.target - g.saved, max = Math.max(0, Math.floor((dir === "in" ? Math.min(need, p.balance) : g.saved) * 100) / 100);
   const go = async () => {
-    const r = await call(dir === "in" ? "/savings" : "/savings/withdraw", { profile_id: me, amount: Number(amt) });
+    const r = await call(dir === "in" ? "/savings" : "/savings/withdraw", { profile_id: me, amount: Number(amt), goal_id: g.id });
     if (r.detail) return setErr(msg(r.detail));
     onClose(); refresh(); if (dir === "in") onCoin?.();
     say(dir === "out" ? `${money(Number(amt))} is back in your wallet` : r.paid ? "Goal reached! Your savings and bonus are in your wallet." : r.reached ? "Goal reached! Waiting for the bonus." : `${money(Number(amt))} moved to savings`);
@@ -258,7 +258,7 @@ function MoveSheet({ me, p, g, start, onClose, refresh, say, onCoin }) {
   return (
     <Sheet title="Move money" onClose={onClose}>
       <div className="seg" role="group" aria-label="Direction"><button className={dir === "in" ? "on" : ""} onClick={() => { setDir("in"); setErr(""); }}>To savings</button><button className={dir === "out" ? "on" : ""} onClick={() => { setDir("out"); setErr(""); }}>To wallet</button></div>
-      <p className="mute">{dir === "in" ? `Wallet ${money(p.balance)}. ${money(need)} to go.` : `Savings ${money(g.saved)}.`}</p>
+      <p className="mute">{dir === "in" ? `Wallet ${money(p.balance)}. ${money(need)} to go for ${g.name}.` : `Savings for ${g.name}: ${money(g.saved)}.`}</p>
       <label>Amount ($)<input autoFocus type="number" inputMode="decimal" step="0.01" value={amt} onChange={e => setAmt(e.target.value)} /></label>
       <button className="link" onClick={() => setAmt(String(max))}>Use the most ({money(max)})</button>
       {err && <p className="err" role="alert">{err}</p>}
@@ -284,9 +284,9 @@ function FundsSheet({ onClose }) {
   );
 }
 
-function GoalSheet({ me, onClose, refresh, say }) {
+function GoalSheet({ me, onClose, onMade, refresh, say }) {
   const [name, setName] = useState(""), [target, setTarget] = useState(""), [err, setErr] = useState("");
-  const go = async () => { const r = await call("/goals", { child_id: me, name: name.trim(), target: Number(target) }); if (r.detail) return setErr(msg(r.detail)); onClose(); refresh(); say("Goal started"); };
+  const go = async () => { const r = await call("/goals", { child_id: me, name: name.trim(), target: Number(target) }); if (r.detail) return setErr(msg(r.detail)); onClose(); onMade?.(r.id); refresh(); say("Goal started"); };
   return (
     <Sheet title="Start a goal" onClose={onClose}>
       <label>What are you saving for?<input autoFocus value={name} onChange={e => setName(e.target.value)} /></label>
@@ -298,7 +298,7 @@ function GoalSheet({ me, onClose, refresh, say }) {
 }
 
 function KidHome({ me, info, refresh, say, go, tick }) {
-  const p = info.profile, r = info.rules, g = p.goal, [sheet, setSheet] = useState(null), [ask, setAsk] = useState(false), [coin, setCoin] = useState(false);
+  const p = info.profile, r = info.rules, gs = p.goals || [], [sel, setSel] = useState(null), g = gs.find(x => x.id === sel) || gs[0] || null, [sheet, setSheet] = useState(null), [ask, setAsk] = useState(false), [coin, setCoin] = useState(false);
   const pct = g ? Math.min(100, Math.round((g.saved / g.target) * 100)) : 0;
   const cancel = async () => { const x = await call(`/goals/${g.id}/cancel`, {}); setAsk(false); refresh(); say(x.detail ? msg(x.detail) : "Goal cancelled. Your savings are back in your wallet."); };
   return (
@@ -312,18 +312,19 @@ function KidHome({ me, info, refresh, say, go, tick }) {
         <button className="btn wide" onClick={() => go("Penny")}>Spend with Penny</button>
       </section>
       <section className="stack savings center">
+        {gs.length > 1 && <div role="group" aria-label="Your goals">{gs.map(x => <button key={x.id} className={"pick" + (x.id === g.id ? " on" : "")} aria-pressed={x.id === g.id} onClick={() => { setSel(x.id); setAsk(false); }}>{x.name}</button>)}</div>}
         <div className="pigwrap lg">{coin && <i className="coin" />}<Piggy pct={pct} mood={g && g.saved >= g.target ? "happy" : "idle"} />{g && <span className="dream" aria-hidden="true" style={{ filter: `grayscale(${1 - pct / 100})`, opacity: 0.35 + 0.65 * (pct / 100) }}>{g.emoji || g.name[0]}</span>}</div>
         {g ? <div><p className="big sm">{money(g.saved)}</p><p className="mute">of {money(g.target)} for {g.name}, {pct}% there</p></div> : <p className="mute">Pick something to save for and I'll keep count.</p>}
         {g && <p className={g.bonus_pct > 0 ? "chip coinchip" : "mute"}>{g.bonus_pct > 0 ? `Bonus when you get there: ${money(g.bonus)} (${g.bonus_pct}%)` : "No bonus on this goal yet"}</p>}
         {g && g.watch && <p className="mute">Watching {g.watch_name}: now {money(g.watch_price)}. I'll tell you if it drops.</p>}
         {g && g.saved >= g.target && <p role="status"><b>Goal reached!</b> Waiting for your grown-up to add the bonus.</p>}
         {!g && <button className="btn wide" onClick={() => setSheet("goal")}>Start a goal</button>}
-        {g && !ask && <><div className="row"><button className="btn" onClick={() => setSheet("in")}>Add to savings</button><button className="alt" onClick={() => setSheet("out")}>Take out</button></div><button className="link" onClick={() => setAsk(true)}>Cancel goal</button></>}
+        {g && !ask && <><div className="row"><button className="btn" onClick={() => setSheet("in")}>Add to savings</button><button className="alt" onClick={() => setSheet("out")}>Take out</button></div><div className="row"><button className="link" onClick={() => setSheet("goal")}>Add another goal</button><button className="link" onClick={() => setAsk(true)}>Cancel goal</button></div></>}
         {g && ask && <div className="stack"><p>Cancel and move {money(g.saved)} back to your wallet? You won't get the bonus.</p><div className="row"><button className="alt" onClick={cancel}>Yes, cancel</button><button className="btn" onClick={() => setAsk(false)}>Keep saving</button></div></div>}
       </section>
       {(sheet === "in" || sheet === "out") && g && <MoveSheet me={me} p={p} g={g} start={sheet} onClose={() => setSheet(null)} refresh={refresh} say={say} onCoin={() => { setCoin(true); setTimeout(() => setCoin(false), 1300); }} />}
       <Orders me={me} tick={p.balance} refresh={refresh} />
-      {sheet === "goal" && <GoalSheet me={me} onClose={() => setSheet(null)} refresh={refresh} say={say} />}
+      {sheet === "goal" && <GoalSheet me={me} onClose={() => setSheet(null)} onMade={setSel} refresh={refresh} say={say} />}
     </>
   );
 }
@@ -498,6 +499,9 @@ function Notifications({ say }) {
 function KidCard({ k, me, say, reload }) {
   const [open, setOpen] = useState(false), [sec, setSec] = useState("Limits"), [d, setD] = useState(null), [f, setF] = useState({ amt: "", week: "", what: "", target: "" }), [pct, setPct] = useState(0);
   useEffect(() => { if (open) call(`/profiles/${k.id}`).then(r => r.rules && setD(r)); }, [open]);
+  const gs = k.goals || [], [gsel, setGsel] = useState(null), cur = gsel === "new" ? null : gs.find(x => x.id === gsel) || gs[0] || null;  // cur: the goal on screen; null means a blank "new goal" form
+  useEffect(() => { setF(x => cur ? { ...x, what: cur.name, target: String(cur.target) } : { ...x, what: "", target: "" }); setPct(cur ? cur.bonus_pct : 0); }, [cur?.id, cur?.name, cur?.target, cur?.bonus_pct, gsel === "new"]);  // fill the form from the goal; edits stay until the goal changes
+  const norm = t => String(t || "").split(/\s+/).filter(Boolean).join(" ").toLowerCase(), match = gs.find(x => norm(x.name) === norm(f.what)) || null;  // a name they already have: only its bonus changes (the server decides the same way)
   const setR = (key, v) => setD({ ...d, rules: { ...d.rules, [key]: v } }), sf = (key, v) => setF({ ...f, [key]: v });
   const done = (r, ok) => { say(r.detail ? msg(r.detail) : ok); reload(); };
   const freeze = async () => { await call(`/freeze/${k.id}`, {}); say(k.frozen ? `${k.name} unfrozen` : `${k.name} frozen`); reload(); };
@@ -506,7 +510,7 @@ function KidCard({ k, me, say, reload }) {
     <section className="card">
       <div className="kidcard">
         <Piggy small pct={k.goal ? Math.min(100, Math.round((k.goal.saved / k.goal.target) * 100)) : 0} />
-        <div className="grow"><b>{k.name}</b><p className="mute">{money(k.balance)} wallet{k.goal ? `, ${money(k.goal.saved)} of ${money(k.goal.target)} saved` : ""}{k.frozen ? ", frozen" : ""}</p></div>
+        <div className="grow"><b>{k.name}</b><p className="mute">{money(k.balance)} wallet{gs.length > 1 ? `, ${money(gs.reduce((t, x) => t + Number(x.saved), 0))} saved across ${gs.length} goals` : k.goal ? `, ${money(k.goal.saved)} of ${money(k.goal.target)} saved` : ""}{k.frozen ? ", frozen" : ""}</p></div>
         <button className="icon" aria-pressed={k.frozen} aria-label={`${k.frozen ? "Unfreeze" : "Freeze"} ${k.name}`} onClick={freeze}><Svg n="snow" s={26} /></button>
         <button className="icon" aria-expanded={open} aria-label={`${open ? "Hide" : "Edit"} limits for ${k.name}`} onClick={() => setOpen(!open)}><Svg n="chev" /></button>
       </div>
@@ -525,13 +529,18 @@ function KidCard({ k, me, say, reload }) {
             {fld("week", "Amount per week ($)")}
             <div className="row"><button className="btn" disabled={!(Number(f.week) > 0)} onClick={() => call(`/allowance/${k.id}`, { amount: Number(f.week) }).then(r => { done(r, "Weekly allowance set"); sf("week", ""); })}>{k.allowance > 0 ? "Change" : "Set weekly"}</button>
               {k.allowance > 0 && <button className="alt" onClick={() => call(`/allowance/${k.id}`, { amount: 0 }).then(r => done(r, "Weekly allowance stopped"))}>Stop</button>}</div></>}
-          {sec === "Goal" && (k.goal ? <>
-            <div className="spread"><b>{k.goal.name}</b><span className="mute">{money(k.goal.saved)} of {money(k.goal.target)}</span></div><Bar a={k.goal.saved} b={k.goal.target} />
-            <BonusSlider goalId={k.goal.id} pct={k.goal.bonus_pct} target={k.goal.target} say={say} onSaved={reload} />{k.goal.watch && <WatchEditor goal={k.goal} say={say} onSaved={reload} />}</> : <>
-            {fld("what", "What are they saving for?", "text")}{fld("target", "Target ($)")}
-            <label>Bonus when they reach it: <b>{pct}%</b> = {money((Number(f.target) || 0) * pct / 100)}<input type="range" min="0" max="100" step="5" value={pct} onChange={e => setPct(Number(e.target.value))} aria-valuetext={`${pct} percent`} /></label>
+          {sec === "Goal" && <>
+            {gs.length > 0 && <div role="group" aria-label="Goals">{gs.map(x => <button key={x.id} className={"pick" + (cur?.id === x.id ? " on" : "")} aria-pressed={cur?.id === x.id} onClick={() => setGsel(x.id)}>{x.name}</button>)}<button className={"pick" + (!cur ? " on" : "")} aria-pressed={!cur} onClick={() => setGsel("new")}>New goal</button></div>}
+            {cur && <><div className="spread"><b>{cur.name}</b><span className="mute">{money(cur.saved)} of {money(cur.target)}</span></div><Bar a={cur.saved} b={cur.target} /></>}
+            {fld("what", "What are they saving for?", "text")}
+            <label>Target ($)<input type="number" inputMode="decimal" step="0.01" value={match ? String(match.target) : f.target} disabled={!!match} onChange={e => sf("target", e.target.value)} /></label>
+            <label>Bonus when they reach it: <b>{pct}%</b> = {money((match ? Number(match.target) : Number(f.target) || 0) * pct / 100)}<input type="range" min="0" max="100" step="5" value={pct} onChange={e => setPct(Number(e.target.value))} aria-valuetext={`${pct} percent`} /></label>
+            {match && <p className="mute" role="status">{k.name} already has {match.name}, so only its bonus changes. It won't add another goal.</p>}
+            {!match && f.what.trim() && <p className="mute" role="status">This starts a new goal for {k.name}.{gs.length > 0 ? " Their other goals stay as they are." : ""}</p>}
             <p className="mute">Optional. Whatever you can add helps them stay motivated.</p>
-            <button className="btn wide" disabled={!f.what.trim() || !(Number(f.target) > 0)} onClick={() => call("/goals", { child_id: k.id, name: f.what.trim(), target: Number(f.target), percent: pct }).then(r => { done(r, "Goal started"); sf("what", ""); sf("target", ""); setPct(0); })}>Start goal</button></>)}
+            <button className="btn wide" disabled={!f.what.trim() || (!match && !(Number(f.target) > 0)) || (!!match && pct === match.bonus_pct)}
+              onClick={() => call("/goals", { child_id: k.id, name: f.what.trim(), target: match ? Number(match.target) : Number(f.target), percent: pct }).then(r => { done(r, r.updated ? (pct ? `Bonus set to ${pct}%` : "Bonus removed") : "Goal started"); if (!r.detail) setGsel(r.id); })}>{match ? "Save bonus" : "Start goal"}</button>
+            {cur?.watch && <WatchEditor goal={cur} say={say} onSaved={reload} />}</>}
         </div>
       )}
     </section>

@@ -35,9 +35,9 @@ GOAL_TOOLS = [
     {"name": "set_goal", "description": "Start a savings goal for the child, after they told you what it is for and how much it costs.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}, "target": {"type": "number", "description": "Dollars"}, "product_id": {"type": "integer", "description": "If the goal is a specific partner item you already found with search_products, pass its id so Stash can watch its price"}}, "required": ["name", "target"]}},
     {"name": "save_money", "description": "Move an amount the child just named from their wallet into their savings goal.",
-     "input_schema": {"type": "object", "properties": {"amount": {"type": "number", "description": "Dollars"}}, "required": ["amount"]}},
+     "input_schema": {"type": "object", "properties": {"amount": {"type": "number", "description": "Dollars"}, "goal": {"type": "string", "description": "Name of the goal. Needed only when the child has more than one goal"}}, "required": ["amount"]}},
     {"name": "move_to_wallet", "description": "Move an amount the child just named from their savings back into their wallet.",
-     "input_schema": {"type": "object", "properties": {"amount": {"type": "number", "description": "Dollars"}}, "required": ["amount"]}},
+     "input_schema": {"type": "object", "properties": {"amount": {"type": "number", "description": "Dollars"}, "goal": {"type": "string", "description": "Name of the goal to take it from. Needed only when the child has more than one goal"}}, "required": ["amount"]}},
 ]
 
 GROWNUP_TOOLS = [
@@ -69,7 +69,7 @@ KID_RULES = """<kid_rules>
 - Sound like a kind, upbeat older sibling. Short words and sentences. Say "wallet", "savings" and "bonus" and skip jargon.
 - Never suggest or search for weapons, alcohol, vapes or tobacco, drugs, gambling, adult content, or anything unsafe or age-restricted. If asked, say you can't help with that and suggest asking a grown-up.
 - If a child says they are hurt, scared, bullied or unsafe, reply warmly, tell them to talk to a grown-up they trust right now, and don't try to solve it yourself.
-- Saving: if they want to save and have no goal, ask what for and how much, one question at a time, then call set_goal. If the goal is a specific partner item, search for it first and pass its product_id so Stash can watch the price and tell them when it drops. Use save_money to move money into savings and move_to_wallet to take it out, only for an amount the child clearly said in their latest message. Saving is their choice, so never pressure them. A grown-up may add an optional bonus (a percent of what they saved) when the goal is reached; don't promise one unless the context says there is one.
+- Saving: if they want to save and have no goal, ask what for and how much, one question at a time, then call set_goal. If the goal is a specific partner item, search for it first and pass its product_id so Stash can watch the price and tell them when it drops. Use save_money to move money into savings and move_to_wallet to take it out, only for an amount the child clearly said in their latest message. A child can have several goals: if they have more than one and don't say which, ask which goal before moving money, and pass its name as goal. Saving is their choice, so never pressure them. A grown-up may add an optional bonus (a percent of what they saved) when the goal is reached; don't promise one unless the context says there is one.
 - Coaching: if a purchase would use most of the wallet or pull them away from their goal, say so in one sentence and ask what they'd like to do. The decision is theirs.
 </kid_rules>"""
 
@@ -95,7 +95,9 @@ You: I can't skip the rules, and that game is over your $25 limit. Want to look 
 
 def build_system(p, rules, goal, memory=None):
     kid = p["role"] == "child"
-    goal_line = f"Savings goal: {goal['name']}, ${float(goal['saved']):.2f} saved of ${float(goal['target']):.2f}, bonus {int(goal['bonus_pct'])}%." if goal else "No savings goal yet."
+    goals = [goal] if isinstance(goal, dict) else list(goal or [])  # one goal or a list of them
+    one = lambda g: f"{g['name']}, ${float(g['saved']):.2f} saved of ${float(g['target']):.2f}, bonus {int(g['bonus_pct'])}%"
+    goal_line = ("Savings goal: " + one(goals[0]) + "." if len(goals) == 1 else "Savings goals: " + "; ".join(one(g) for g in goals) + "." if goals else "No savings goal yet.")
     likes = f"Interests: {', '.join(p['interests'])}." if p.get("interests") else ""
     who = f"Person: {p['name']}, a {'kid' if kid else 'grown-up'}."
     ctx = (f"<context>\n{who}\nWallet balance: ${float(p['balance']):.2f}. {goal_line if kid else ''} {likes}\n"
