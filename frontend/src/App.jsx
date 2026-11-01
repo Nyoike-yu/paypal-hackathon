@@ -306,9 +306,9 @@ function KidHome({ me, info, refresh, say, go, tick }) {
       {p.frozen && <p className="card err" role="alert">Spending is paused.</p>}
       <Proposals me={me} refresh={refresh} say={say} limit={2} tick={tick} />
       <section className="stack bal">
-        <div className="spread"><span className="mute">Wallet</span><span className="mute">{money(r.per_purchase_cap)} per buy, {money(r.weekly_budget)} a week</span></div>
+        <span className="mute">Wallet</span>
         <p className="big">{money(p.balance)}</p>
-        {p.allowance > 0 && <p className="mute">Allowance {money(p.allowance)} every week, next {nextDate(p.allowance_next)}</p>}
+        <p className="mute">{money(r.per_purchase_cap)} per buy, {money(r.weekly_budget)} a week</p>
         <button className="btn wide" onClick={() => go("Penny")}>Spend with Penny</button>
       </section>
       <section className="stack savings center">
