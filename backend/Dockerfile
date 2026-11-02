@@ -6,6 +6,10 @@ FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Install PayPal's MCP server in its own folder. Its `mcp` command would clash with the Python `mcp` package's script.
+RUN npm install --prefix /opt/paypal-mcp @paypal/mcp@1.8.1
+ENV PAYPAL_MCP_COMMAND="node /opt/paypal-mcp/node_modules/@paypal/mcp/dist/index.js --tools=orders.get"
+
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
