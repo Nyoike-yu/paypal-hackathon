@@ -104,7 +104,7 @@ function Piggy({ pct = 0, small, tiny, deco, mood = "idle" }) {  // mood: idle, 
 export default function App() {
   const [me, setMe] = useState(Number(localStorage.getItem("me")) || null), [info, setInfo] = useState(null), [tab, setTab] = useState("Home"), [toast, setToast] = useState(null);
   const timer = useRef();
-  const refresh = () => me && call(`/profiles/${me}`).then(r => (r.profile ? setInfo(r) : (localStorage.clear(), setMe(null))));
+  const refresh = () => me && call(`/profiles/${me}`).then(r => r.profile && setInfo(r));
   const say = (text, action) => { setToast({ text, action }); clearTimeout(timer.current); timer.current = setTimeout(() => setToast(null), 4500); };
   const [tick, setTick] = useState(0), [intent, setIntent] = useState(() => {  // a tapped notification opens the app at its address
     const i = parseIntent(location.href); if (!i) return null;
@@ -397,7 +397,12 @@ function Chat({ me, info, say, refresh }) {
     const f = e.target.files[0]; e.target.value = ""; setMenu(false); if (!f) return;
     try { setImg({ b64: await shrink(f), url: URL.createObjectURL(f) }); } catch { say("Couldn't read that image."); }
   };
-  const open = async o => { const r = await call("/open-link", { profile_id: me, url: o.url }); r.status === "open" ? window.open(r.url, "_blank", "noopener") : say(r.reason || msg(r.detail), r.reason ? "Alerts" : undefined); };
+  const open = async o => {
+    const w = window.open("about:blank", "_blank");
+    const r = await call("/open-link", { profile_id: me, url: o.url });
+    if (r.status === "open") { if (w) w.location.assign(r.url); else location.assign(r.url); }
+    else { if (w) w.close(); say(r.reason || msg(r.detail), r.reason ? "Alerts" : undefined); }
+  };
   const send = async m => {
     const t = (m || "").trim(); if ((!t && !img) || busy) return;
     const image_b64 = img?.b64;

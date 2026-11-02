@@ -35,7 +35,7 @@ async def lifespan(_):
     yield
     task.cancel(); await asyncio.to_thread(paypal_mcp.stop); pool.close()
 
-app = FastAPI(title="Allowance Agent", lifespan=lifespan)
+app = FastAPI(title="Stash", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(","), allow_methods=["*"], allow_headers=["*"])
 ai = gemini.Client(max_retries=2, timeout=30.0)
 APP_URL = os.getenv("APP_URL", "http://localhost:5173").rstrip("/")
