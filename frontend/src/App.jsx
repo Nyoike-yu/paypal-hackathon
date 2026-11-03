@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 const API = import.meta.env.VITE_API || "http://localhost:8000";
 const APP = "Stash"; // working name: change it here
-const hdr = () => ({ "Content-Type": "application/json", Authorization: `Bearer ${localStorage.getItem("t") || ""}` });
+const hdr = () => ({ "Content-Type": "application/json", Authorization: `Bearer ${sessionStorage.getItem("t") || ""}` });
 const request = async (path, body) => {
   try {
     const res = await fetch(API + path, { method: body !== undefined ? "POST" : "GET", headers: hdr(), body: body !== undefined ? JSON.stringify(body) : undefined });
-    if (res.status === 401 && localStorage.getItem("t")) { localStorage.clear(); location.reload(); }
+    if (res.status === 401 && sessionStorage.getItem("t")) { sessionStorage.clear(); location.reload(); }
     return { status: res.status, data: await res.json().catch(() => ({ detail: "Something went wrong. Try again." })) };
   } catch { return { status: 0, data: { detail: "Can't reach the server." } }; }
 };
@@ -102,7 +102,7 @@ function Piggy({ pct = 0, small, tiny, deco, mood = "idle" }) {  // mood: idle, 
 }
 
 export default function App() {
-  const [me, setMe] = useState(Number(localStorage.getItem("me")) || null), [info, setInfo] = useState(null), [tab, setTab] = useState("Home"), [toast, setToast] = useState(null);
+  const [me, setMe] = useState(Number(sessionStorage.getItem("me")) || null), [info, setInfo] = useState(null), [tab, setTab] = useState("Home"), [toast, setToast] = useState(null);
   const timer = useRef();
   const refresh = () => me && call(`/profiles/${me}`).then(r => r.profile && setInfo(r));
   const say = (text, action) => { setToast({ text, action }); clearTimeout(timer.current); timer.current = setTimeout(() => setToast(null), 4500); };
@@ -111,7 +111,7 @@ export default function App() {
     const u = new URLSearchParams(location.search); ["go", "do", "item"].forEach(k => u.delete(k));
     history.replaceState({}, "", location.pathname + (u.toString() ? "?" + u : "")); return i;
   });
-  const logout = async () => { await pushOff(); localStorage.clear(); setMe(null); setInfo(null); };  // this device stops getting this person's notifications
+  const logout = async () => { await pushOff(); sessionStorage.clear(); setMe(null); setInfo(null); };  // this device stops getting this person's notifications
   useEffect(() => { refresh(); setTab("Home"); }, [me]);
   useEffect(() => {
     if (!me || !canPush()) return;
@@ -135,7 +135,7 @@ export default function App() {
     const oid = u.get("token"); if (!oid) return;
     call("/funds/capture", { order_id: oid }).then(r => { say(r.detail ? msg(r.detail) : "Money added to your balance"); refresh(); });
   }, [me]);
-  if (!me) return <Login onIn={r => { localStorage.setItem("t", r.token); localStorage.setItem("me", r.id); setMe(r.id); }} />;
+  if (!me) return <Login onIn={r => { sessionStorage.setItem("t", r.token); sessionStorage.setItem("me", r.id); setMe(r.id); }} />;
   if (!info) return <div className="app stack" aria-busy="true" aria-label="Loading"><Skel h={56} /><Skel h={150} /><Skel h={110} /></div>;
   const p = info.profile, kid = p.role === "child";
   const tabs = kid ? ["Home", "Penny", "Alerts", "Settings"] : ["Home", "Agent", "Alerts", "Settings"];

@@ -36,9 +36,9 @@ async def lifespan(_):
     task.cancel(); await asyncio.to_thread(paypal_mcp.stop); pool.close()
 
 app = FastAPI(title="Stash", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(","), allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=os.getenv("ALLOWED_ORIGINS", "https://paypal-hackathon-beta.vercel.app/").split(","), allow_methods=["*"], allow_headers=["*"])
 ai = gemini.Client(max_retries=2, timeout=30.0)
-APP_URL = os.getenv("APP_URL", "http://localhost:5173").rstrip("/")
+APP_URL = os.getenv("APP_URL", "https://paypal-hackathon-beta.vercel.app/").rstrip("/")
 MERCHANT_EMAIL = os.getenv("MERCHANT_PAYOUT_EMAIL", "")
 
 def q(sql, args=(), one=False):
@@ -773,8 +773,8 @@ SECRET = os.environ["SECRET_KEY"].encode()
 if len(SECRET) < 16: raise RuntimeError("SECRET_KEY must be a long random string")
 def _sign(p): return hmac.new(SECRET, p.encode(), hashlib.sha256).hexdigest()
 
-def make_token(uid, ttl=86400):
-    p = base64.urlsafe_b64encode(json.dumps({"sub": uid, "exp": int(time.time()) + ttl}).encode()).decode()
+def make_token(uid):
+    p = base64.urlsafe_b64encode(json.dumps({"sub": uid}).encode()).decode()
     return f"{p}.{_sign(p)}"
 
 def current_user(authorization: str = Header(default="")) -> int:
@@ -782,7 +782,6 @@ def current_user(authorization: str = Header(default="")) -> int:
         p, sig = authorization.removeprefix("Bearer ").split(".")
         if not hmac.compare_digest(sig, _sign(p)): raise ValueError
         d = json.loads(base64.urlsafe_b64decode(p))
-        if d["exp"] < time.time(): raise ValueError
         return int(d["sub"])
     except Exception:
         raise HTTPException(401, "Please sign in again.")
