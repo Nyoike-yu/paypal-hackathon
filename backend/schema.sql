@@ -39,8 +39,8 @@ create index on missions(status, created_at);
 alter table purchases add column trace jsonb;
 alter table goals add column watch_product_id int references products(id), add column watch_price numeric, add column buy_below numeric, add column last_saved_at timestamptz;
 
--- Notifications: one inbox, real pushes, and a one-day life after something is dealt with.
--- (On an existing database, run from here down in the Supabase SQL editor.)
+-- notifications: one inbox, real pushes, and handled items disappear after a day
+-- (on an existing database run from here down in the Supabase SQL editor)
 alter table alerts add column key text, add column needs_action boolean not null default false, add column act text, add column handled_at timestamptz;
 create index on alerts(profile_id, handled_at);
 create index on alerts(profile_id, key) where handled_at is null;
@@ -49,10 +49,16 @@ create index on proposals(profile_id, decided_at);
 create table push_subs(id serial primary key, profile_id int not null references profiles(id) on delete cascade, endpoint text not null unique, p256dh text not null, auth text not null, created_at timestamptz default now());
 create index on push_subs(profile_id);
 
--- Refunds: money sent from a guardian's balance back to the PayPal account they paid with.
--- status: refunding (debited, waiting on PayPal) | refunded | failed (money given back in the app) | review (PayPal never confirmed: a person must check)
--- (On an existing database, run from here down in the Supabase SQL editor.)
+-- refunds: money sent from a guardian's balance back to the PayPal account they paid with
+-- status: refunding (debited, waiting on PayPal) | refunded | failed (money given back in the app) | review (PayPal never confirmed, a person has to check)
+-- (on an existing database run from here down in the Supabase SQL editor)
 create table refunds(id serial primary key, profile_id int not null references profiles(id), order_id text not null references pay_orders(order_id), capture_id text not null, amount numeric not null check (amount > 0), status text not null default 'refunding', paypal_ref text, reason text, attempts int not null default 1, tried_at timestamptz not null default now(), created_at timestamptz not null default now(), done_at timestamptz);
 create index on refunds(order_id);
 create index on refunds(status, tried_at) where status = 'refunding';
 create unique index on proposals((data->>'order_id')) where kind = 'refund' and status = 'open';
+
+-- Penny's memory: the last day of chat, kept on the server so the browser can't rewrite it.
+-- memo = short facts from the tools that turn used, offered = items shown with their prices (so a "yes" can buy them), picks = store cards shown.
+-- (on an existing database run from here down in the Supabase SQL editor)
+create table chat_messages(id serial primary key, profile_id int not null references profiles(id) on delete cascade, role text not null check (role in ('user','assistant')), content text not null, memo text, offered jsonb not null default '[]', picks jsonb, order_id int references purchases(id) on delete set null, created_at timestamptz not null default now());
+create index on chat_messages(profile_id, id desc);

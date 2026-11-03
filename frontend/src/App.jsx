@@ -10,7 +10,7 @@ const request = async (path, body) => {
   } catch { return { status: 0, data: { detail: "Can't reach the server." } }; }
 };
 const call = async (path, body) => (await request(path, body)).data;
-// ---- notifications: standard Web Push, so it works on phones and computers ----
+// notifications
 const b64u = k => Uint8Array.from(atob((k + "=".repeat((4 - (k.length % 4)) % 4)).replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
 const ios = () => /iPad|iPhone|iPod/.test(navigator.userAgent);
 const swReady = () => Promise.race([navigator.serviceWorker.ready, new Promise((_, no) => setTimeout(no, 4000))]);
@@ -37,7 +37,7 @@ async function pushOn() {  // must run from a tap: browsers only ask permission 
 async function pushOff() {
   try { const sub = await mySub(); if (sub) { await call("/push/unsubscribe", { endpoint: sub.endpoint }); await sub.unsubscribe(); } } catch {}
 }
-// where a tapped notification should land: /?go=Alerts&item=p12 or /?do=funds
+// where a tapped notification lands: /?go=Alerts&item=p12 or /?do=funds
 const parseIntent = u => { const q = new URL(u, location.origin).searchParams; return q.get("go") || q.get("do") ? { go: q.get("go"), do: q.get("do"), item: q.get("item") } : null; };
 const TABS = ["Home", "Penny", "Agent", "Alerts", "Settings"];
 const shrink = async f => {
@@ -54,7 +54,7 @@ const Logo = () => <div className="logo"><Piggy deco pct={55} mood="happy" /></d
 const LBL = { Agent: "Penny" };  // one name per tab: the adult chat is Penny too
 const Skel = ({ h }) => <div className="skel" style={{ height: h }} />;
 const Empty = ({ text, mood = "happy" }) => <div className="empty"><Piggy small deco pct={40} mood={mood} /><p className="mute">{text}</p></div>;
-// product photo: the server can send image, image_url or images[]; partner items fall back to their emoji, then the first letter
+// product photo: the server can send image, image_url or images[], partner items fall back to their emoji, then the first letter
 const imgOf = o => o.image || o.image_url || (Array.isArray(o.images) && o.images[0]) || null;
 function Pick({ o, open }) {
   const [bad, setBad] = useState(false), src = imgOf(o), ok = o.verdict === "ok", label = { ok: "Within limits", needs_approval: "Needs approval" }[o.verdict] || "Blocked";

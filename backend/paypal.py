@@ -1,8 +1,7 @@
-"""A small PayPal REST client: Orders v2 (create and capture), Payouts, and webhook verification.
+"""small PayPal REST client: Orders v2 (create and capture), Payouts, refunds and webhook verification.
 
-With PAYPAL_CLIENT_ID and PAYPAL_SECRET set it talks to PayPal (sandbox by default, live when PAYPAL_ENV=live).
-Without them every call is simulated, so the whole flow also runs on a laptop with no keys.
-"""
+with PAYPAL_CLIENT_ID and PAYPAL_SECRET set it talks to PayPal (sandbox by default, live when PAYPAL_ENV=live).
+without them every call is simulated so the whole flow runs on a laptop with no keys"""
 import os, time, uuid, threading
 from decimal import Decimal
 import httpx
@@ -33,14 +32,14 @@ def _token(h):
         return _tok["v"]
 
 def fresh_token():
-    """A brand-new access token, ignoring the cache. The MCP server is started with one token, so it gets a new one before that expires."""
+    """a brand new access token, ignoring the cache. the MCP server is started with one token so it needs a new one before that expires"""
     with _lock:
         _tok["exp"] = 0.0
     with _client() as h:
         return _token(h)
 
 def token_ttl():
-    """Seconds until the cached access token expires."""
+    """seconds until the cached access token expires"""
     return max(0.0, _tok["exp"] - time.time())
 
 def _call(method, path, body=None, request_id=None):
@@ -58,7 +57,7 @@ def money(x):
     return f"{Decimal(str(x)):.2f}"
 
 def create_order(amount, description, return_url, cancel_url, request_id=None):
-    """Start a checkout. Returns (order_id, url the buyer must open to approve the payment)."""
+    """starts a checkout. returns (order_id, url the buyer opens to approve the payment)"""
     if not configured():
         oid = "SIM-" + uuid.uuid4().hex[:12]
         return oid, f"{return_url}{'&' if '?' in return_url else '?'}token={oid}&simulated=1"
@@ -73,7 +72,7 @@ def create_order(amount, description, return_url, cancel_url, request_id=None):
     return d["id"], link
 
 def capture_order(order_id, request_id=None):
-    """Take the money after the buyer approved. Returns {"ok": bool, "amount": Decimal|None, "capture_id": str}."""
+    """takes the money after the buyer approved. returns {"ok": bool, "amount": Decimal|None, "capture_id": str}"""
     if not configured():
         if not order_id.startswith("SIM-"): raise PayPalError("unknown order")
         return {"ok": True, "amount": None, "capture_id": "SIMCAP-" + order_id[4:]}
@@ -86,7 +85,7 @@ def capture_order(order_id, request_id=None):
         raise PayPalError("unexpected capture response") from e
 
 def get_order(order_id):
-    """Read one order (read-only). Returns PayPal's order JSON; in demo mode a small stand-in so the whole flow runs with no keys."""
+    """reads one order (read-only). returns PayPal's order JSON, in demo mode a small stand-in so the flow runs with no keys"""
     if not configured():
         if not order_id.startswith("SIM-"): raise PayPalError("unknown order")
         return {"id": order_id, "status": "SIMULATED"}
@@ -94,7 +93,7 @@ def get_order(order_id):
     return _call("GET", f"/v2/checkout/orders/{order_id}")
 
 def order_summary(d):
-    """Keep only what is safe and useful to show: status, amount, date. No payer name, email or address ever leaves here. None if d isn't an order."""
+    """keeps only what's safe and useful to show: status, amount, date. no payer name, email or address ever leaves here. None if d isn't an order"""
     if not isinstance(d, dict) or not d.get("status"): return None
     try:
         pu = (d.get("purchase_units") or [{}])[0]
@@ -106,7 +105,7 @@ def order_summary(d):
         return None
 
 def order_capture(d):
-    """The captured payment inside an order, for refunds: {capture_id, status, amount, refunded}. Internal only: it is never shown to the model. None if there isn't one."""
+    """the captured payment inside an order, for refunds: {capture_id, status, amount, refunded}. internal only, never shown to the model. None if there isn't one"""
     try:
         pays = ((d.get("purchase_units") or [{}])[0].get("payments") or {})
         cap = (pays.get("captures") or [None])[0]
@@ -117,7 +116,7 @@ def order_capture(d):
         return None
 
 def order_refunds(d):
-    """Refunds PayPal lists on an order: [{id, status, amount, invoice_id}]. Empty if none or unreadable."""
+    """refunds PayPal lists on an order: [{id, status, amount, invoice_id}]. empty if none or unreadable"""
     try:
         return [{"id": x.get("id"), "status": x.get("status"), "amount": Decimal(x["amount"]["value"]), "invoice_id": x.get("invoice_id")}
                 for x in ((d.get("purchase_units") or [{}])[0].get("payments") or {}).get("refunds") or []]
@@ -129,11 +128,11 @@ _REFUND_WHY = {"CAPTURE_FULLY_REFUNDED": "PayPal says this payment was already r
                "REFUND_NOT_ALLOWED_AFTER_180_DAYS": "PayPal only allows refunds within 180 days of the payment."}
 
 def refund_capture(capture_id, amount, note, request_id, invoice_id):
-    """Send money back to the buyer who paid. Returns {"state", "ref", "why"}; state is one of:
-      refunded: PayPal accepted it (COMPLETED or PENDING).
-      failed:   PayPal definitely did not refund it, so the money can safely go back into the app balance.
-      unknown:  we can't tell (timeout, PayPal busy, odd reply). Ask again later with the SAME request_id: PayPal then returns the first result and never refunds twice.
-    Never raises. Without PayPal keys it is simulated, like the rest of the app."""
+    """sends money back to the buyer who paid. returns {"state", "ref", "why"}, state is one of:
+      refunded: PayPal accepted it (COMPLETED or PENDING)
+      failed:   PayPal definitely did not refund it, so the money can safely go back into the app balance
+      unknown:  can't tell (timeout, PayPal busy, odd reply). ask again later with the SAME request_id, PayPal then returns the first result and never refunds twice
+    never raises. without PayPal keys it's simulated like the rest of the app"""
     out = lambda state, ref=None, why=None: {"state": state, "ref": ref, "why": why}
     if not configured():
         return out("refunded", "SIMREF-" + request_id[-12:]) if capture_id.startswith("SIMCAP-") else out("failed", why="That payment isn't one I can refund.")
@@ -159,7 +158,7 @@ def refund_capture(capture_id, amount, note, request_id, invoice_id):
     return out("unknown")
 
 def payout(email, amount, note, batch_id):
-    """Pay a merchant from the Stash PayPal balance. Returns PayPal's batch id (a stable batch_id makes a retry safe)."""
+    """pays a merchant from the Stash PayPal balance. returns PayPal's batch id (a stable batch_id makes a retry safe)"""
     if not configured() or not email:
         return "SIM-PAYOUT-" + batch_id
     d = _call("POST", "/v1/payments/payouts", {
@@ -172,7 +171,7 @@ def payout(email, amount, note, batch_id):
         raise PayPalError("unexpected payout response") from e
 
 def verify_webhook(headers, event):
-    """True only if PayPal signed this event for our webhook id."""
+    """True only if PayPal signed this event for our webhook id"""
     wid = os.getenv("PAYPAL_WEBHOOK_ID")
     if not configured() or not wid: return False
     d = _call("POST", "/v1/notifications/verify-webhook-signature", {

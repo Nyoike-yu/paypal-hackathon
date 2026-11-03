@@ -1,4 +1,4 @@
-"""Pure rules engine: no I/O, so it is fast and trivially testable. All money is Decimal."""
+"""pure rules engine, no I/O so it's fast and easy to test. all money is Decimal"""
 def evaluate(frozen, balance, rules, spent, price, store, partner=True):
     if frozen: return "blocked", "The agent is frozen by a guardian."
     if partner and store not in rules["allowed_stores"]: return "blocked", f"{store} isn't on the allowed stores list."
@@ -9,8 +9,8 @@ def evaluate(frozen, balance, rules, spent, price, store, partner=True):
     return "ok", "Within all the rules."
 
 def checks(frozen, balance, rules, spent, price, store, partner=True):
-    """The same rules as evaluate(), laid out as a checklist people can read: [{"level": ok|warn|bad, "text"}].
-    evaluate() still makes the decision; this only explains it, so the two can never disagree about what is allowed."""
+    """the same rules as evaluate() laid out as a checklist people can read: [{"level": ok|warn|bad, "text"}].
+    evaluate() still makes the decision, this only explains it, so the two can't disagree about what's allowed"""
     c = lambda level, text: {"level": level, "text": text}
     out = [c("bad", "Spending is paused by a grown-up") if frozen else c("ok", "Spending isn't paused")]
     if partner: out.append(c("ok", f"{store} is an allowed store") if store in rules["allowed_stores"] else c("bad", f"{store} isn't an allowed store"))

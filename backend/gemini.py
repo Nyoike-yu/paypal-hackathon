@@ -1,17 +1,16 @@
 """Gemini, behind the small interface the rest of the app already uses.
 
 main.py and brain.py call `ai.messages.create(model, max_tokens, system, tools, messages, ...)` and read back
-`stop_reason` and `content` blocks of type "text" / "tool_use". This module keeps exactly that shape and translates
-to and from Google's google-genai SDK, so the agent loop, the tool schemas, the guards and the test fakes do not change.
+`stop_reason` and `content` blocks of type "text" / "tool_use". i kept that exact shape and translate to and from
+Google's google-genai SDK, so the agent loop, tool schemas, guards and test fakes didn't have to change.
 
-Notes that come from how Gemini works:
-  - Tool calls carry a "thought signature" that must be sent back on the next turn. Each block we return keeps the
-    original Gemini part in `raw`, and to_contents() sends that part back untouched.
-  - A tool result must match its call by name (and by id when Gemini gave one), so results are labelled from the calls.
-  - Recent Gemini models ignore `temperature`, so it is accepted and dropped.
-  - Thinking tokens count toward max_output_tokens, so we add headroom (GEMINI_THINKING_HEADROOM, default 2048).
-  - The client is created on first use, so importing this with no API key is harmless (demo mode and tests).
-"""
+things i ran into with Gemini:
+  - tool calls carry a "thought signature" that has to go back on the next turn. every block keeps the original part
+    in `raw` and to_contents() sends it back untouched
+  - a tool result has to match its call by name (and by id when Gemini gave one), so i label results from the calls
+  - recent Gemini models ignore `temperature`, so it's accepted and dropped
+  - thinking tokens count toward max_output_tokens, so i add headroom (GEMINI_THINKING_HEADROOM, default 2048)
+  - the client is created on first use, so importing this with no API key is harmless (demo mode and tests)"""
 import os, json, uuid, base64, threading
 from types import SimpleNamespace
 from google import genai
@@ -20,7 +19,7 @@ from google.genai import types
 DEFAULT_MODEL = "gemini-3.6-flash"
 
 class APIError(Exception):
-    """Any failure talking to Gemini (network, quota, bad key, blocked or malformed request)."""
+    """any failure talking to Gemini (network, quota, bad key, blocked or malformed request)"""
 
 def api_key():
     return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
@@ -31,12 +30,12 @@ def has_key():
 def model_name():
     return os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
 
-# ---------- Messages-style input -> Gemini ----------
+# Messages-style input -> Gemini
 def _get(o, k, default=None):
     return o.get(k, default) if isinstance(o, dict) else getattr(o, k, default)
 
 def _wire_id(call_id):
-    """Ids we made up ("gem-...") were never Gemini's, so they are not sent back."""
+    """ids i made up ("gem-...") were never Gemini's, so they don't get sent back"""
     return None if not call_id or str(call_id).startswith("gem-") else str(call_id)
 
 def _result_dict(content):
@@ -45,7 +44,7 @@ def _result_dict(content):
     return v if isinstance(v, dict) else {"result": v}
 
 def to_contents(messages):
-    names = {}  # tool call id -> function name, to label the results that come back
+    names = {}  # tool call id -> function name, so i can label the results
     out = []
     for m in messages:
         role = "model" if m["role"] == "assistant" else "user"
@@ -55,7 +54,7 @@ def to_contents(messages):
             t = _get(b, "type")
             if t == "tool_use": names[_get(b, "id")] = _get(b, "name")
             raw = _get(b, "raw")
-            if raw is not None: parts.append(raw); continue  # a part Gemini produced: send it back exactly as it was (keeps thought signatures)
+            if raw is not None: parts.append(raw); continue  # a part Gemini made: send it back exactly as it was (keeps the thought signatures)
             if t == "text":
                 if _get(b, "text"): parts.append(types.Part(text=_get(b, "text")))
             elif t == "image":
@@ -79,7 +78,7 @@ def to_tools(tools):
         decls.append(types.FunctionDeclaration(**kw))
     return [types.Tool(function_declarations=decls)] if decls else None
 
-# ---------- Gemini output -> Messages-style ----------
+# Gemini output -> Messages-style
 def from_response(res):
     cands = getattr(res, "candidates", None) or []
     content = getattr(cands[0], "content", None) if cands else None
@@ -92,7 +91,7 @@ def from_response(res):
             blocks.append(SimpleNamespace(type="text", text=p.text, raw=p))
     return SimpleNamespace(stop_reason="tool_use" if any(b.type == "tool_use" for b in blocks) else "end_turn", content=blocks)
 
-# ---------- the client ----------
+# The client
 class Client:
     def __init__(self, max_retries=2, timeout=30.0):
         self._max_retries, self._timeout = max_retries, timeout
@@ -108,7 +107,7 @@ class Client:
 
     def _create(self, *, messages, model=None, max_tokens=1024, system=None, tools=None, tool_choice=None, **_ignored):  # _ignored: temperature etc.
         cfg = {"system_instruction": system, "max_output_tokens": int(max_tokens) + int(os.getenv("GEMINI_THINKING_HEADROOM", "2048")),
-               "automatic_function_calling": types.AutomaticFunctionCallingConfig(disable=True)}  # our code runs the tools, not the SDK
+               "automatic_function_calling": types.AutomaticFunctionCallingConfig(disable=True)}  # my code runs the tools, not the SDK
         level = os.getenv("GEMINI_THINKING_LEVEL", "").strip()
         if level: cfg["thinking_config"] = types.ThinkingConfig(thinking_level=level.upper())  # optional: low / medium / high
         decls = to_tools(tools)

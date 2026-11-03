@@ -1,4 +1,4 @@
-"""Penny: the system prompt, tool schemas and safety guards. Everything here is plain Python, so it is tested without a model."""
+"""Penny's system prompt, tool schemas and safety guards. all plain python so i can test it without a model"""
 import re
 
 BLOCKED_FOR_KIDS = re.compile(
@@ -9,7 +9,7 @@ def unsafe_for_kids(text):
     return bool(BLOCKED_FOR_KIDS.search(text or ""))
 
 def confirmed(text):
-    """The person's latest message has to contain a clear yes before anything is bought."""
+    """the latest message has to contain a clear yes before anything is bought"""
     return bool(AFFIRM.search(text or ""))
 
 TOOLS = [

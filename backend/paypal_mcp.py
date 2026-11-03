@@ -1,16 +1,15 @@
 """PayPal's official MCP server (@paypal/mcp), used for one read-only job: looking up the status of an order.
 
-Penny never sees this server's tools. The app exposes its own tool (lookup_topup), checks in the database that the order
-belongs to the person asking, and only then calls get_order() here. The server is started with `--tools=orders.get`,
-so even this process can do nothing but read an order.
+Penny never sees this server's tools. the app has its own tool (lookup_topup), checks in the database that the order
+belongs to the person asking, and only then calls get_order() here. the server is started with `--tools=orders.get`
+so even this process can't do anything except read an order.
 
-It is optional and fails soft. With no PayPal keys, no Node.js (npx), no `mcp` package, or PAYPAL_MCP=off, start() does nothing
-and callers use the PayPal REST API (or demo mode) instead. get_order() raises paypal.PayPalError on any problem, never anything else.
-"""
+it's optional and fails soft. with no PayPal keys, no Node.js (npx), no `mcp` package, or PAYPAL_MCP=off, start() does nothing
+and callers use the PayPal REST API (or demo mode) instead. get_order() raises paypal.PayPalError on any problem, never anything else"""
 import os, json, time, shlex, shutil, asyncio, logging, threading
 import paypal
 
-TOOL = "get_order"  # the one tool of the PayPal MCP server we call; it takes {"id": order_id}
+TOOL = "get_order"  # the one tool of the PayPal MCP server i call, takes {"id": order_id}
 
 _loop = None
 _thread = None
@@ -24,33 +23,33 @@ def enabled():
     return paypal.configured() and os.getenv("PAYPAL_MCP", "on").lower() != "off"
 
 def available():
-    """True while a live session with the MCP server is up."""
+    """True while a live session with the MCP server is up"""
     return _ready.is_set()
 
 def _split(text):
-    """Split a command line, keeping "quoted paths with spaces" together (C:\\My Projects\\python.exe on Windows)."""
+    """splits a command line but keeps "quoted paths with spaces" together (matters for Windows paths)"""
     return [a.strip('"') for a in shlex.split(text, posix=(os.name != "nt"))]
 
 def _command():
-    # PAYPAL_MCP_COMMAND exists so tests can point at a stand-in server; leave it unset in real use.
+    # PAYPAL_MCP_COMMAND is only so tests can point at a stand-in server, leave it unset in real use
     custom = _split(os.getenv("PAYPAL_MCP_COMMAND", ""))
     if custom: return custom[0], custom[1:]
     return "npx", ["-y", os.getenv("PAYPAL_MCP_PACKAGE", "@paypal/mcp@1.8.1"), "--tools=orders.get"]
 
-# Network and npm settings the child needs to download and run the package (behind a proxy or a custom CA, npx hangs without them).
+# network and npm settings the child needs to download and run the package. behind a proxy or a custom CA npx just hangs without them
 _NETWORK_VARS = {"http_proxy", "https_proxy", "no_proxy", "all_proxy", "node_extra_ca_certs", "ssl_cert_file", "ssl_cert_dir",
                  "npm_config_registry", "npm_config_cache", "npm_config_userconfig", "npm_config_proxy", "npm_config_https_proxy", "npm_config_cafile"}
 
 def _child_env(token):
-    """What the MCP server process gets: network settings plus the PayPal access token and nothing else.
-    It is third-party code, so it never sees our Anthropic key, database URL, signing key or PayPal secret."""
+    """what the MCP server process gets: network settings plus the PayPal access token and nothing else.
+    it's third-party code so it never sees my Gemini key, database url, signing key or PayPal secret"""
     env = {k: v for k, v in os.environ.items() if k.lower() in _NETWORK_VARS}
     env["PAYPAL_ACCESS_TOKEN"] = token
     env["PAYPAL_ENVIRONMENT"] = "PRODUCTION" if os.getenv("PAYPAL_ENV") == "live" else "SANDBOX"
     return env
 
 def start():
-    """Start the background session. Returns at once and never raises."""
+    """starts the background session. returns at once and never raises"""
     global _thread, _loop
     try:
         if _thread is not None or not enabled(): return
@@ -113,7 +112,7 @@ async def _serve():
                     if TOOL not in names: raise RuntimeError(f"the PayPal MCP server doesn't offer {TOOL} (it offers {names})")
                     _session = s; _ready.set(); delay = 15
                     logging.info("PayPal MCP server connected (read-only order lookups)")
-                    # stay connected until asked to stop or reconnect, and reconnect with a new token before this one expires
+                    # stay connected until told to stop or reconnect, and reconnect with a new token before this one expires
                     await _wait_any(max(60.0, paypal.token_ttl() - 300), _stop_ev, _restart_ev)
         except asyncio.CancelledError:
             raise
@@ -122,12 +121,12 @@ async def _serve():
         finally:
             _ready.clear(); _session = None
         if _stop_ev.is_set(): break
-        if _restart_ev.is_set(): continue  # a planned reconnect (new token): no waiting
+        if _restart_ev.is_set(): continue  # planned reconnect (new token), no waiting
         await _wait_any(delay, _stop_ev)
         delay = min(delay * 2, 300)
 
 def _poke_restart():
-    """Ask the session to reconnect with a fresh token (at most once a minute)."""
+    """asks the session to reconnect with a fresh token (at most once a minute)"""
     global _last_poke
     if time.time() - _last_poke < 60 or _loop is None or _restart_ev is None: return
     _last_poke = time.time()
@@ -141,7 +140,7 @@ def _text(res):
     return "".join(getattr(c, "text", "") or "" for c in (getattr(res, "content", None) or []))
 
 def parse_order_json(text, order_id):
-    """The server's text reply as PayPal's order dict; PayPalError if it isn't the order we asked for. Internal use only: it holds payer details."""
+    """the server's text reply as PayPal's order dict, PayPalError if it isn't the order i asked for. internal use only, it holds payer details"""
     i, j = text.find("{"), text.rfind("}")
     if i < 0 or j <= i: raise paypal.PayPalError("MCP reply wasn't an order")
     try:
@@ -153,19 +152,19 @@ def parse_order_json(text, order_id):
     return d
 
 def parse_order(text, order_id):
-    """The same reply reduced to the safe summary the model may see."""
+    """same reply reduced to the safe summary the model may see"""
     s = paypal.order_summary(parse_order_json(text, order_id))
     if not s: raise paypal.PayPalError("MCP reply had no order status")
     return s
 
 def get_order_json(order_id, timeout=15):
-    """Look up one order through the MCP server and return PayPal's order dict (for the app's own checks). Raises paypal.PayPalError on any problem."""
+    """looks up one order through the MCP server and returns PayPal's order dict (for the app's own checks). raises paypal.PayPalError on any problem"""
     s, loop = _session, _loop
     if not _ready.is_set() or s is None or loop is None: raise paypal.PayPalError("PayPal MCP isn't connected")
     fut = asyncio.run_coroutine_threadsafe(s.call_tool(TOOL, {"id": order_id}), loop)
     try:
         res = fut.result(timeout)
-    except Exception as e:  # a closed pipe, a timeout or a crashed server: reconnect, and let the caller use the API
+    except Exception as e:  # closed pipe, timeout or crashed server: reconnect, and let the caller use the API
         fut.cancel(); _poke_restart()
         raise paypal.PayPalError(f"PayPal MCP call failed ({type(e).__name__})") from e
     txt = _text(res)
@@ -175,7 +174,7 @@ def get_order_json(order_id, timeout=15):
     return parse_order_json(txt, order_id)
 
 def get_order(order_id, timeout=15):
-    """Look up one order through the MCP server. Returns paypal.order_summary(); raises paypal.PayPalError on any problem."""
+    """looks up one order through the MCP server. returns paypal.order_summary(), raises paypal.PayPalError on any problem"""
     s = paypal.order_summary(get_order_json(order_id, timeout))
     if not s: raise paypal.PayPalError("MCP reply had no order status")
     return s

@@ -19,10 +19,10 @@ import agent, brain, paypal, paypal_mcp, push
 
 load_dotenv()
 pool = ConnectionPool(os.environ["DATABASE_URL"], min_size=1, max_size=10, open=False,
-                      kwargs={"row_factory": dict_row, "autocommit": True, "prepare_threshold": None})  # prepare_threshold=None keeps Supabase's pooler happy
+                      kwargs={"row_factory": dict_row, "autocommit": True, "prepare_threshold": None})  # prepare_threshold=None because the Supabase pooler doesn't like prepared statements
 
 async def _sweeper():
-    """Every 5 minutes: pay full goals and due weekly allowances (failed charges are retried). Claims are atomic, so extra instances are harmless."""
+    """runs every 5 min: pays full goals and due allowances, retries failed charges. claims are atomic so a second instance can't double pay"""
     while True:
         try: await asyncio.to_thread(sweep_all)
         except Exception: logging.exception("reward sweep failed")
@@ -31,7 +31,7 @@ async def _sweeper():
 @asynccontextmanager
 async def lifespan(_):
     pool.open(); task = asyncio.create_task(_sweeper())
-    paypal_mcp.start()  # PayPal's MCP server for read-only order lookups; does nothing if it isn't set up
+    paypal_mcp.start()  # starts PayPal's MCP server for order lookups, no-op if it isn't set up
     yield
     task.cancel(); await asyncio.to_thread(paypal_mcp.stop); pool.close()
 
@@ -48,17 +48,17 @@ def q(sql, args=(), one=False):
             return None
         return cur.fetchone() if one else cur.fetchall()
 
-ACTIVITY = {"completed": "Bought", "blocked": "Blocked", "refused": "Stopped", "saved": "Saved", "cancelled": "Cancelled"}  # what a kid does that a grown-up sees on Alerts and is pushed about
+ACTIVITY = {"completed": "Bought", "blocked": "Blocked", "refused": "Stopped", "saved": "Saved", "cancelled": "Cancelled"}  # what a kid does that the grown-up sees on Alerts and gets pushed about
 
 def link(go=None, item=None, do=None):
-    """Where a tapped notification lands. The web app reads these from the address."""
+    """where a tapped notification lands. the frontend reads these params from the url"""
     return "/?" + urlencode({k: v for k, v in (("go", go), ("item", item), ("do", do)) if v})
 
 def forget_sub(endpoint):
     q("delete from push_subs where endpoint=%s", (endpoint,))
 
 def deliver(pid, title, body, url, tag=None):
-    """Push one notification to every device this person is signed in on. Never blocks and never raises."""
+    """push to every device this person is signed in on. never blocks, never raises"""
     if not push.configured(): return
     try:
         push.enqueue(q("select endpoint,p256dh,auth from push_subs where profile_id=%s", (pid,)), {"title": str(title)[:80], "body": str(body or "")[:160], "url": url, "tag": tag, "pid": pid}, forget_sub)
@@ -72,9 +72,10 @@ def log(pid, event, detail):
         if c and c["guardian_id"]: deliver(c["guardian_id"], f"{c['name']}: {ACTIVITY[event].lower()}", detail, link("Alerts"), tag=f"activity-{pid}")
 
 def notify(pid, title, body, steps=None, goal_id=None, key=None, needs_action=False, act=None, silent=False):
-    """Put a message on the person's Alerts tab and push it to their devices.
-    key: one open message per key (a repeat is ignored until the first is dealt with). needs_action: stays until the thing it asks for happens (see resolve).
-    act='funds': tapping it opens Add money. silent: no push (the person is looking at the app right now)."""
+    """puts a message on the person's Alerts tab and pushes it to their devices.
+    key: only one open message per key, repeats are ignored until the first is dealt with.
+    needs_action: sticks around until the thing it asks for happens (see resolve).
+    act='funds': tapping it opens Add money. silent: skip the push, they're looking at the app right now"""
     row = q("""insert into alerts(profile_id,title,body,next_steps,goal_id,key,needs_action,act)
                select %s::int,%s::text,%s::text,%s::text,%s::int,%s::text,%s::boolean,%s::text
                where %s::text is null or not exists (select 1 from alerts where profile_id=%s::int and key=%s::text and handled_at is null) returning id""",
@@ -84,26 +85,26 @@ def notify(pid, title, body, steps=None, goal_id=None, key=None, needs_action=Fa
     return row and row["id"]
 
 def resolve(pid, key):
-    """The thing an alert asked for has happened: it now counts as dealt with, and leaves the tab a day later."""
+    """the alert's job is done. it counts as handled and disappears a day later"""
     q("update alerts set handled_at=now() where profile_id=%s and key=%s and handled_at is null", (pid, key))
 
 def tidy():
-    """Housekeeping: old unopened notes stop cluttering the tab after a week, and long-finished ones are deleted."""
+    """housekeeping: plain notes expire after a week, old handled ones get deleted"""
     q("update alerts set handled_at=now() - interval '1 day' where handled_at is null and not needs_action and created_at < now() - interval '7 days'")
     q("delete from alerts where handled_at < now() - interval '3 days'")
 
 def debit(pid, amount):
-    """Atomic: takes the money only if the balance covers it."""
+    """atomic: only takes the money if the balance covers it"""
     return bool(q("update profiles set balance=balance-%s where id=%s and balance>=%s returning id", (amount, pid, amount), one=True))
 
 def pay_goal(gid):
-    """Goal reached: release the savings, plus the bonus (a percent of what was saved) taken from the guardian's balance."""
+    """goal hit its target: release the savings plus the bonus (a % of savings), which comes out of the guardian's balance"""
     g = q("update goals set status='paying' where id=%s and status='active' and saved>=target returning *", (gid,), one=True)  # atomic claim
     if not g: return False
     c = q("select name, guardian_id from profiles where id=%s", (g["child_id"],), one=True)
     bonus = (g["saved"] * g["bonus_pct"] / 100).quantize(Decimal("0.01"))
     if bonus > 0 and not (c["guardian_id"] and debit(c["guardian_id"], bonus)):
-        q("update goals set status='active' where id=%s", (gid,))  # stays full; retried when the guardian adds money
+        q("update goals set status='active' where id=%s", (gid,))  # goal stays full, retried when the guardian adds money
         if not g["charge_failed"]:
             q("update goals set charge_failed=true where id=%s", (gid,))
             if c["guardian_id"]: notify(c["guardian_id"], "Add money to pay the bonus", f"{c['name']} reached {g['name']}. Add ${bonus:.2f} to your balance and we'll pay the bonus automatically.", None, gid, key=f"bonus:{gid}", needs_action=True, act="funds")
@@ -122,13 +123,13 @@ def sweep_goals():
     return sum(pay_goal(r["id"]) for r in q("select id from goals where status='active' and saved>=target"))
 
 def pay_allowances():
-    """Weekly allowance: taken from the guardian's balance into the child's wallet. The claim is atomic, so it can't pay twice."""
+    """weekly allowance, guardian balance -> kid wallet. the claim is atomic so it can't pay twice"""
     paid = 0
     for r in q("select id, allowance_next from profiles where allowance>0 and allowance_next <= now()"):
         due = r["allowance_next"]
         c = q("""update profiles set allowance_next = case when %s::timestamptz + interval '7 days' > now() then %s::timestamptz + interval '7 days' else now() + interval '7 days' end
                  where id=%s and allowance>0 and allowance_next=%s returning name, guardian_id, allowance, allowance_failed""", (due, due, r["id"], due), one=True)
-        if not c: continue  # another instance claimed it
+        if not c: continue  # another instance got it first
         amt = c["allowance"]
         if not (c["guardian_id"] and debit(c["guardian_id"], amt)):
             q("update profiles set allowance_next=%s where id=%s and allowance>0", (due, r["id"]))  # try again on the next sweep
@@ -150,7 +151,7 @@ def sweep_all():
     tidy()
     return n
 
-MAX_GOALS = 20  # per child; a guard against a runaway loop, not a limit anyone should meet
+MAX_GOALS = 20  # per kid. just a guard against a runaway loop, nobody should hit this
 _gkey = lambda t: " ".join(str(t).split()).casefold()  # goal names match ignoring case and extra spaces
 
 def create_goal(child_id, name, target, by, percent=0, product_id=None):
@@ -158,10 +159,10 @@ def create_goal(child_id, name, target, by, percent=0, product_id=None):
     if not name or len(name) > 60: raise HTTPException(422, "Give the goal a short name.")
     t = D(target)
     if t <= 0 or t > 10000: raise HTTPException(422, "Pick a target between $0.01 and $10,000.")
-    pct = int(percent) if by != child_id else 0  # only a grown-up adds a bonus, and it's optional
+    pct = int(percent) if by != child_id else 0  # only a grown-up adds a bonus, and it's optional anyway
     watch = q("select id, price from products where id=%s", (product_id,), one=True) if product_id else None
     if product_id and not watch: raise HTTPException(422, "Unknown item.")
-    with plock(child_id):  # a child can have many goals, but not two with the same name (and not an endless pile)
+    with plock(child_id):  # a kid can have lots of goals but not two with the same name, and not an endless pile
         mine = q("select name from goals where child_id=%s and status in ('active','paying')", (child_id,))
         if any(_gkey(m["name"]) == _gkey(name) for m in mine): raise HTTPException(409, f"There's already a goal called {name}.")
         if len(mine) >= MAX_GOALS: raise HTTPException(409, f"That's {MAX_GOALS} goals already. Finish or cancel one before adding another.")
@@ -176,9 +177,9 @@ def create_goal(child_id, name, target, by, percent=0, product_id=None):
     return {"id": g["id"], "name": name, "target": float(t)}
 
 def bonus_on_existing(child_id, name, percent):
-    """If `name` is one of the child's goals (same words, ignoring case and extra spaces), set that goal's bonus and return it.
-    Returns None when no goal has that name, so the caller starts a new goal. Target and saved money are never touched here."""
-    with plock(child_id):  # same lock as deposits, so the goal can't reach its target halfway through
+    """if the name matches one of the kid's goals (ignoring case and spaces) set that goal's bonus and return it.
+    returns None when nothing matches so the caller starts a new goal. never touches target or saved"""
+    with plock(child_id):  # same lock as deposits so the goal can't hit its target halfway through
         g = next((x for x in q("select id, name, target, bonus_pct, status from goals where child_id=%s and status in ('active','paying') order by id", (child_id,)) if _gkey(x["name"]) == _gkey(name)), None)
         if not g: return None
         if g["status"] != "active": raise HTTPException(409, f"{g['name']} is already reached. Its bonus is being paid, so it can't change now.")
@@ -190,7 +191,7 @@ def bonus_on_existing(child_id, name, percent):
     return {"id": g["id"], "name": g["name"], "target": float(g["target"]), "bonus_pct": pct, "updated": True}
 
 def pick_goal(pid, goal_id=None):
-    """The open goal money should move to or from. Several goals and none named is an error that lists them, so nobody guesses."""
+    """which open goal money moves to or from. several goals and none named raises an error that lists them, no guessing"""
     if goal_id is not None:
         g = q("select * from goals where id=%s and child_id=%s and status='active'", (goal_id, pid), one=True)
         if not g: raise HTTPException(404, "That goal isn't open any more.")
@@ -201,7 +202,7 @@ def pick_goal(pid, goal_id=None):
     return gs[0]
 
 def goal_by_name(pid, name):
-    """The id of the open goal the model named, or None when it named none (pick_goal then decides)."""
+    """id of the goal the model named, or None if it didn't name one (pick_goal sorts that out)"""
     if not name: return None
     g = next((x for x in q("select id, name from goals where child_id=%s and status='active'", (pid,)) if _gkey(x["name"]) == _gkey(name)), None)
     if not g: raise HTTPException(404, f"There's no open goal called {name}.")
@@ -210,7 +211,7 @@ def goal_by_name(pid, name):
 def deposit(pid, amount, goal_id=None):
     a = D(amount)
     if a <= 0: raise HTTPException(422, "Pick an amount above zero.")
-    with plock(pid):  # serialised with purchases and cancels for this child
+    with plock(pid):  # same lock as purchases and cancels for this kid
         g = pick_goal(pid, goal_id)
         need = g["target"] - g["saved"]
         if a > need: raise HTTPException(422, f"You only need ${need:.2f} more.")
@@ -231,11 +232,11 @@ def take_back(pid, amount, goal_id=None):
         log(pid, "saved", f"${a:.2f} moved back from {g['name']}")
     return {"ok": True}
 
-# ---------- Rules engine: plain code, never the model ----------
+# Rules engine
 D = lambda x: Decimal(str(x))
 
 def load_ctx(pid):
-    """One round trip: profile, rules and 7-day spend in a single indexed query."""
+    """profile, rules and 7 day spend in one query"""
     return q("""select p.frozen, p.balance, r.per_purchase_cap, r.weekly_budget, r.approval_threshold, r.allowed_stores,
              (select coalesce(sum(amount),0) from purchases where profile_id=p.id and status='completed' and created_at > now()-interval '7 days') spent
              from profiles p join rules r on r.profile_id=p.id where p.id=%s""", (pid,), one=True)
@@ -245,7 +246,7 @@ def judge(ctx, price, store, partner=True):
     return evaluate(ctx["frozen"], ctx["balance"], rules, ctx["spent"], D(price), store, partner)
 
 def judge_checks(ctx, price, store, partner=True):
-    """The rule checklist for one price, for display (the decision itself comes from judge)."""
+    """the rule checklist, for display only. judge() still makes the decision"""
     rules = {k: ctx[k] for k in ("per_purchase_cap", "weekly_budget", "approval_threshold", "allowed_stores")}
     return checks(ctx["frozen"], ctx["balance"], rules, ctx["spent"], D(price), store, partner)
 
@@ -253,8 +254,8 @@ def check_rules(pid, prod, partner=True):
     return judge(load_ctx(pid), prod["price"], prod["store"], partner)
 
 def settle(pid, prod, why, purchase_id=None, trace=None):
-    """Pay for a partner-store item: the price leaves the child's wallet, PayPal pays the merchant, and the order is recorded.
-    The debit is atomic and comes first; it is given back if PayPal fails."""
+    """pays for a partner item: price leaves the wallet, PayPal pays the merchant, order gets recorded.
+    the debit is atomic and goes first, and it's given back if PayPal fails"""
     if not debit(pid, prod["price"]): raise HTTPException(409, "Not enough balance.")
     try:
         ref = paypal.payout(MERCHANT_EMAIL, prod["price"], f"{prod['name']} ({prod['store']})", f"purchase-{purchase_id or uuid.uuid4().hex[:12]}")
@@ -270,11 +271,11 @@ ORDER_SQL = """select pu.id, p.name as item, p.store, pu.amount, pu.status, pu.f
                (pu.reason ilike 'approved%%') as was_approved, pu.trace from purchases pu join products p on p.id=pu.product_id"""
 
 def attempt(pid, product_id, trace=None, approved=False):
-    """Run a purchase through the rules. approved=True means a person already said yes to the approval line (the other limits still apply)."""
+    """runs a purchase through the rules. approved=True means a person already said yes to the approval step (the other limits still apply)"""
     prod = q("select * from products where id=%s", (product_id,), one=True)
     if not prod: raise HTTPException(404, "Unknown product")
     steps = list(trace or [])
-    with plock(pid):  # serialises check + debit per profile, so concurrent buys can't beat the weekly budget (single process)
+    with plock(pid):  # check + debit under one lock per profile so concurrent buys can't beat the weekly budget (only works with a single process)
         verdict, why = check_rules(pid, prod)
         if verdict == "needs_approval" and approved:
             who = q("select role from profiles where id=%s", (pid,), one=True)["role"]
@@ -294,7 +295,7 @@ def attempt(pid, product_id, trace=None, approved=False):
     return {"status": status, "reason": why, "product": prod["name"], "order": q(ORDER_SQL + " where pu.id=%s", (oid,), one=True) if status != "blocked" else None}
 
 def sweep_orders():
-    """Demo fulfilment for the mock partner stores: shipped after 2 minutes, delivered 3 minutes later. A real partner reports this itself."""
+    """fake fulfilment for the demo stores: shipped after 2 min, delivered 3 min after that. a real partner would report this itself"""
     n = 0
     for r in q("""update purchases set fulfillment='shipped', shipped_at=now() where status='completed' and fulfillment='processing' and created_at < now() - interval '2 minutes'
                   returning profile_id, (select name from products where id=product_id) as item"""):
@@ -305,9 +306,9 @@ def sweep_orders():
     return n
 
 
-# ---------- Autonomy: the agent proposes, the rules decide, a person approves ----------
+# Autonomy
 def propose(profile_id, child_id, kind, title, body, data=None, trace=None):
-    """File a proposal for a person to accept or decline. The agent never spends on its own authority."""
+    """files a proposal for a person to accept or decline. the agent never spends on its own"""
     row = q("insert into proposals(profile_id,child_id,kind,title,body,data,trace) values(%s,%s,%s,%s,%s,%s,%s) on conflict do nothing returning id",
             (profile_id, child_id, kind, title, body, Jsonb(data or {}), Jsonb(trace or [])), one=True)
     if row: deliver(profile_id, title, body, link("Alerts", item=f"p{row['id']}"), tag=f"proposal-{row['id']}")
@@ -317,7 +318,7 @@ def recently(child_id, kind, days):
     return bool(q("select 1 from proposals where child_id=%s and kind=%s and created_at > now() - %s::interval", (child_id, kind, f"{days} days"), one=True))
 
 def plan_mission(mid):
-    """Turn a mission ("an art kit and a soccer ball under $30") into one basket proposal, in the background."""
+    """turns a mission ("art kit and a soccer ball under $30") into one basket proposal, runs in the background"""
     m = q("update missions set status='planning' where id=%s and status='queued' returning *", (mid,), one=True)
     if not m: return None
     p = q("select id, name, role, guardian_id, interests from profiles where id=%s", (m["profile_id"],), one=True)
@@ -328,7 +329,7 @@ def plan_mission(mid):
     for it in m["items"]:
         term, qty = str(it["query"])[:60], max(1, min(int(it.get("qty", 1)), 5))
         like = f"%{term}%"
-        rows = q("select id,name,store,price from products where (name ilike %s or category ilike %s) and store = any(%s) and price <= %s order by price limit 5", (like, like, rules["allowed_stores"], rules["per_purchase_cap"]))  # the rules decide what is on the table
+        rows = q("select id,name,store,price from products where (name ilike %s or category ilike %s) and store = any(%s) and price <= %s order by price limit 5", (like, like, rules["allowed_stores"], rules["per_purchase_cap"]))  # the rules decide what's on the table
         if not rows:
             missing.append(term); trace.append(f"Looked for '{term}': nothing in the allowed stores within the per-purchase limit"); continue
         groups.append({"query": term, "qty": qty, "options": rows})
@@ -344,7 +345,7 @@ def plan_mission(mid):
             b = g_["options"][0]; trace.append(f"Looked for '{term}': {len(opts)} match(es), picked {b['name']} at {b['store']} for ${b['price']:.2f} (the cheapest)")
         basket.append({"product_id": b["id"], "name": b["name"], "store": b["store"], "price": float(b["price"]), "qty": g_["qty"], "_q": term})
     total = sum(D(b["price"]) * b["qty"] for b in basket)
-    if ranked and total > room:  # the model says what matters least; the code only accepts that when the budget really is short
+    if ranked and total > room:  # the model says what matters least, the code only goes along with it if the budget really is short
         for b in [b for b in basket if b["_q"] in ranked["drop"]]:
             if total > room:
                 basket.remove(b); total -= D(b["price"]) * b["qty"]
@@ -370,7 +371,7 @@ def run_missions():
     return sum(1 for r in q("select id from missions where status='queued' and created_at < now() - interval '1 minute'") if plan_mission(r["id"]))
 
 def cancel_order(purchase_id, event_note):
-    """Cancel a paid order that hasn't arrived and put the money back in the wallet. (A real store would also refund through PayPal.)"""
+    """cancels a paid order that hasn't arrived and puts the money back in the wallet. a real store would refund through PayPal too"""
     row = q("update purchases set status='cancelled', fulfillment='cancelled' where id=%s and status='completed' and fulfillment in ('processing','shipped') returning profile_id, amount", (purchase_id,), one=True)
     if not row: raise HTTPException(409, "That order can't be cancelled any more.")
     q("update profiles set balance=balance+%s where id=%s", (row["amount"], row["profile_id"]))
@@ -378,21 +379,21 @@ def cancel_order(purchase_id, event_note):
     return row
 
 def cancellable(r):
-    """An order a person can still call off: a request waiting for approval, or a paid one that hasn't been delivered."""
+    """can this order still be called off? pending, or paid but not delivered yet"""
     return r["status"] == "pending" or (r["status"] == "completed" and r["fulfillment"] in ("processing", "shipped"))
 
 def order_list(pid):
-    """A person's recent orders, for Penny's list_orders tool."""
+    """recent orders for Penny's list_orders tool"""
     rows = q(ORDER_SQL + " where pu.profile_id=%s and pu.status in ('completed','pending','cancelled','declined') order by pu.id desc limit 5", (pid,))
     return {"orders": [{"order_id": r["id"], "item": r["item"], "store": r["store"], "amount": r["amount"], "status": r["status"], "delivery": r["fulfillment"], "can_cancel": cancellable(r),
                         "date": r["created_at"].strftime("%Y-%m-%d")} for r in rows]} if rows else {"orders": [], "note": "No orders yet."}
 
 def cancel_my_order(by, order_id=None, owner=None):
-    """Call off an order that hasn't been delivered, for the person who made it or their guardian. One function for the button, the API and Penny.
-    A paid order goes back to the wallet; a request nobody has approved yet is simply withdrawn. Both claims are atomic, so a double tap or a race with
-    the guardian's approval or the delivery sweep can't do it twice. Raises HTTPException with a plain reason when it can't."""
+    """cancels an undelivered order for whoever made it or their guardian. the button, the API and Penny all go through this one function.
+    paid order -> money back to the wallet, unapproved request -> just withdrawn. both claims are atomic so a double tap, or a race with
+    approval or delivery, can't run it twice. raises HTTPException with a plain reason when it can't"""
     owner = owner or by
-    if order_id is None:  # "cancel my order": fine when there's exactly one candidate, otherwise ask which
+    if order_id is None:  # "cancel my order" is fine if there's exactly one candidate, otherwise ask which
         rows = [r for r in q(ORDER_SQL + " where pu.profile_id=%s and pu.status in ('pending','completed') order by pu.id desc limit 10", (owner,)) if cancellable(r)]
         if not rows: raise HTTPException(404, "There's no order that can be cancelled. Delivered orders can't be.")
         if len(rows) > 1: raise HTTPException(409, "More than one order can be cancelled (" + "; ".join(f"order {r['id']}: {r['item']} ${r['amount']:.2f}" for r in rows[:4]) + "). Ask which one.")
@@ -406,7 +407,7 @@ def cancel_my_order(by, order_id=None, owner=None):
                 raise HTTPException(409, "That request was just decided, so it can't be cancelled.")
             back, step = D(0), f"Cancelled by {who} before it was approved"
         else:
-            back = cancel_order(order_id, f"cancelled by {who}")["amount"]  # 409 if it was delivered a moment ago
+            back = cancel_order(order_id, f"cancelled by {who}")["amount"]  # 409 if it got delivered a moment ago
             step = f"Cancelled by {who}. ${back:.2f} went back to the wallet"
         q("update purchases set trace=coalesce(trace,'[]'::jsonb) || %s where id=%s", (Jsonb([step]), order_id))
     if by == owner: log(owner, "cancelled", f"{o['item']} (${o['amount']:.2f}): " + ("request withdrawn, nothing was charged" if back == 0 else "cancelled, money back in the wallet"))
@@ -425,7 +426,7 @@ def suggest_replacement(o, trace, cancel_first):
                    {"product_id": rep["id"], "order_id": o["id"], "cancel_first": cancel_first}, trace)
 
 def handle_partner_event(purchase_id, event):
-    """A partner store reports a problem. cancelled: refund and offer a replacement. delayed: offer to cancel and swap."""
+    """a partner store reports a problem. cancelled: refund and offer a replacement. delayed: offer to cancel and swap"""
     o = q("select pu.id, pu.profile_id, pu.product_id, pu.amount, p.category, p.name as item, p.store from purchases pu join products p on p.id=pu.product_id where pu.id=%s", (purchase_id,), one=True)
     if not o: raise HTTPException(404, "Unknown order")
     if event == "cancelled":
@@ -438,7 +439,7 @@ def handle_partner_event(purchase_id, event):
     raise HTTPException(422, "Unknown event")
 
 def check_watches():
-    """Goals tied to an item: notice a price drop, offer to lower the target, and (only if a grown-up set a buy-below price) buy it."""
+    """goals tied to an item: spot a price drop, offer to lower the target, and only buy it if a grown-up set a buy-below price"""
     n = 0
     for g in q("""select g.*, p.price as now_price, p.name as item, p.store, pr.guardian_id, pr.name as kid from goals g join products p on p.id=g.watch_product_id
                   join profiles pr on pr.id=g.child_id where g.status='active' and g.watch_product_id is not null and g.watch_price is distinct from p.price"""):
@@ -466,8 +467,8 @@ def check_watches():
     return n
 
 def nudge_save(child_id, why, goal_id=None):
-    """Suggest moving a slice of the wallet into savings, at most once every 6 days.
-    Penny (the model) picks the amount and writes the note; the app caps the amount at half the wallet and falls back to a quarter of it."""
+    """suggests moving part of the wallet into savings, at most once every 6 days.
+    Penny picks the amount and writes the note, but the app caps it at half the wallet and falls back to a quarter"""
     g = (q("select id, name, target, saved from goals where id=%s and child_id=%s and status='active'", (goal_id, child_id), one=True) if goal_id else
          q("select id, name, target, saved from goals where child_id=%s and status='active' and saved < target order by id limit 1", (child_id,), one=True))
     kid = q("select name, balance from profiles where id=%s", (child_id,), one=True); bal = kid["balance"]
@@ -487,7 +488,7 @@ def nudge_stalled():
     return sum(1 for r in q("select id, child_id from goals where status='active' and coalesce(last_saved_at, created_at) < now() - interval '7 days' order by id") if nudge_save(r["child_id"], ["You haven't added to this goal for a week"], r["id"]))
 
 def nudge_limits():
-    """Tell a grown-up when a child keeps hitting the per-purchase limit, and suggest a new one based on what they actually tried."""
+    """tells a grown-up when a kid keeps hitting the per-purchase limit, and suggests a new one based on what they actually tried"""
     n = 0
     for r in q("""select profile_id, count(*) n, max(amount) top from purchases where status='blocked' and reason like 'The limit for one purchase%%' and created_at > now() - interval '7 days'
                   group by profile_id having count(*) >= 3"""):
@@ -531,16 +532,16 @@ def execute_proposal(pr, uid):
         return {"ok": True}
     raise HTTPException(422, "Unknown proposal")
 
-# ---------- Real-store search (Channel3) ----------
-OFFERED = TTLCache(maxsize=5000, ttl=900)  # (profile, product id) the agent showed, so it can only buy what was really offered
-OFFERS = TTLCache(maxsize=2000, ttl=900)  # (profile, url) -> offer; bounded, expires, never shared across users
+# Real-store search
+OFFERED = TTLCache(maxsize=5000, ttl=900)  # (profile, product id) the agent showed, so it can only buy what it really offered
+OFFERS = TTLCache(maxsize=2000, ttl=900)  # (profile, url) -> offer. bounded, expires, never shared between users
 _lock = threading.Lock()
 _locks = [threading.Lock() for _ in range(64)]
 def plock(pid): return _locks[pid % 64]
 _hits = TTLCache(maxsize=10000, ttl=600)
 
 def throttle(pid, limit=20, window=60):
-    """Sliding-window limiter for costly calls (in-memory: use Redis once there is more than one instance)."""
+    """sliding window limiter for expensive calls. in memory for now, i'll need Redis once there's more than one instance"""
     with _lock:
         now, dq = time.monotonic(), _hits.setdefault(pid, deque())
         while dq and now - dq[0] > window: dq.popleft()
@@ -548,7 +549,7 @@ def throttle(pid, limit=20, window=60):
         dq.append(now)
 
 def product_image(p):
-    """First usable photo URL from a Channel3 product. Field names vary, so try the likely ones; https only."""
+    """first usable photo url from a Channel3 product. field names vary so i try the likely ones, https only"""
     for k in ("image_urls", "images", "image_url", "image", "thumbnail"):
         v = p.get(k)
         for x in (v if isinstance(v, list) else [v]):
@@ -583,20 +584,20 @@ def web_search(pid, query=None, image_b64=None):
             with _lock: OFFERS[(pid, o["url"])] = {"title": p.get("title"), "store": store, "price": price}
             out.append({"title": p.get("title"), "store": store, "price": price, "url": o["url"], "image": product_image(p), "verdict": verdict, "why": why, "checks": judge_checks(ctx, price, store, False)})
         except (KeyError, TypeError, ValueError, ArithmeticError, AttributeError):
-            bad = bad or p  # Channel3 sent something shaped differently from what we expect
+            bad = bad or p  # Channel3 sent something shaped differently than i expected
     if bad is not None and not out:
         logging.warning("Channel3 products we couldn't read. First one: %s", json.dumps(bad, default=str)[:700])  # paste this line if search still fails
     return out
 
 def _offer_price(o):
-    """An offer's price as a number. Channel3's docs show {"price": {"amount": 9}}, {"price": {"price": 9}} and a bare number, so all three work. None if there isn't one."""
+    """offer price as a float. Channel3's docs show {price: {amount}}, {price: {price}} and a bare number so i handle all three. None if there isn't one"""
     v = o.get("price") if isinstance(o, dict) else None
     if isinstance(v, dict): v = v.get("amount", v.get("price"))
     try: return float(v) if v is not None else None
     except (TypeError, ValueError): return None
 
-# Backup when the live price search fails or finds nothing: links that open each store's own search page. Built by code from this list, never
-# written by the model, so they can't be made up. Add or remove stores here (use {q} where the search words go).
+# fallback for when the live price search fails or finds nothing: links that open each store's own search page.
+# built here in code, never by the model, so they can't be made up. add or remove stores in this list ({q} is where the search words go)
 STORE_LINKS = [("Jumia", "https://www.jumia.co.ke/catalog/?q={q}"), ("Kilimall", "https://www.kilimall.co.ke/search?q={q}"), ("Amazon", "https://www.amazon.com/s?k={q}"),
                ("Best Buy", "https://www.bestbuy.com/site/searchpage.jsp?st={q}"), ("eBay", "https://www.ebay.com/sch/i.html?_nkw={q}")]
 
@@ -608,15 +609,15 @@ def store_links(pid, term):
         out.append({"title": term, "store": name, "url": url, "link_only": True})
     return out
 
-# ---------- Penny's memory ----------
-# The last day of chat is kept in the chat_messages table (never trusted from the browser). Each assistant row also keeps short "memo" facts
-# from the tools that turn used (what was shown with ids and prices, what was bought), so a "yes" next turn can buy the item that was offered.
+# Penny's memory
+# the last day of chat lives in the chat_messages table, i never trust the browser for it. each assistant row also keeps short "memo" facts
+# from the tools it used (what was shown with ids and prices, what was bought) so a "yes" next turn can buy the right item
 def ago(mins): return "just now" if mins < 1 else f"{mins} min ago" if mins < 90 else f"{round(mins / 60)} h ago"
 
-def safe_title(t): return " ".join(re.sub(r"[^\w\s$.,&'()/+-]", "", str(t or "")).split())[:50]  # one line, plain characters only  # titles from other stores are untrusted text on its way into the prompt
+def safe_title(t): return " ".join(re.sub(r"[^\w\s$.,&'()/+-]", "", str(t or "")).split())[:50]  # one line, plain characters only. titles from other stores are untrusted and end up in the prompt
 
 def tool_note(name, inp, result):
-    """One short fact about what a tool just returned. Never raises: a failure here must not hide that a purchase happened."""
+    """one short fact about what a tool returned. never raises, a failure here must not hide that a purchase happened"""
     try:
         if name == "search_products" and isinstance(result, list):
             return ["Showed partner items: " + "; ".join(f"{x['name']} ({x['store']}, ${x['price']:.2f}, id {x['id']})" for x in result[:5])] if result else []
@@ -633,7 +634,7 @@ def tool_note(name, inp, result):
     return []
 
 def load_memory(pid):
-    """The recent turns for the model, plus the facts the tools returned in them. Items shown in the last 30 minutes count as offered again (so a yes can buy them)."""
+    """recent turns for the model plus the facts the tools returned in them. anything shown in the last 30 min counts as offered again so a yes can buy it"""
     rows = q("""select role, content, memo, offered, round(extract(epoch from now() - created_at) / 60)::int as mins from chat_messages
                 where profile_id=%s and created_at > now() - interval '24 hours' order by id desc limit 12""", (pid,))[::-1]
     facts = []
@@ -646,7 +647,7 @@ def load_memory(pid):
     return [{"role": r["role"], "content": r["content"]} for r in rows], facts[-6:]
 
 def remember(pid, message, text, picks, order, notes, offered):
-    """Save one finished turn. A failure here is logged and never breaks the reply."""
+    """saves one finished turn. a failure gets logged and never breaks the reply"""
     try:
         with pool.connection() as c, c.transaction():
             c.execute("insert into chat_messages(profile_id, role, content) values(%s,'user',%s)", (pid, (message or "").strip()[:500] or "(sent a photo)"))
@@ -656,23 +657,23 @@ def remember(pid, message, text, picks, order, notes, offered):
     except Exception:
         logging.exception("couldn't save the chat")
 
-# ---------- Agent / coach ----------
+# Agent
 def run_agent(pid, message, history=None, image_b64=None):
-    """One chat turn. Returns (reply text, product picks, order, mission ids). The model proposes; the code decides what is allowed."""
+    """one chat turn. returns (reply text, picks, order, mission ids). the model proposes, the code decides what's allowed"""
     p = q("select * from profiles where id=%s", (pid,), one=True)
     r = q("select * from rules where profile_id=%s", (pid,), one=True)
     g = q("select name, target, saved, bonus_pct from goals where child_id=%s and status='active' order by id", (pid,))
     kid = p["role"] == "child"
-    past, facts = load_memory(pid) if history is None else ([dict(h) for h in history][-8:], [])  # None: Penny's own saved memory of this chat
+    past, facts = load_memory(pid) if history is None else ([dict(h) for h in history][-8:], [])  # None means use Penny's saved memory of this chat
     system = agent.build_system(p, r, g, facts)
     tools = agent.TOOLS + (agent.GOAL_TOOLS if kid else agent.GROWNUP_TOOLS)
     msgs = past
-    while msgs and msgs[0]["role"] != "user": msgs.pop(0)  # the API needs the first turn to come from the user
+    while msgs and msgs[0]["role"] != "user": msgs.pop(0)  # the model needs the first turn to be from the user
     content = [{"type": "text", "text": message or "Find this for me."}]
     if image_b64: content.insert(0, {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}})
     msgs.append({"role": "user", "content": content if image_b64 else message})
-    picks, order, missions, trace = [], None, [], []  # trace: what the agent really did this turn, shown to people as "How Penny decided"
-    notes, offered = [], []  # what this turn's tools returned, saved with the reply as Penny's memory
+    picks, order, missions, trace = [], None, [], []  # trace = what the agent really did this turn, shown to people as "How Penny decided"
+    notes, offered = [], []  # what this turn's tools returned, saved with the reply as her memory
     def done(text):
         remember(pid, message, text, picks, order, notes, offered)
         return text, picks, order, missions
@@ -717,7 +718,7 @@ def run_agent(pid, message, history=None, image_b64=None):
                     prod_id = int(inp["product_id"])
                     if (pid, prod_id) not in OFFERED: raise HTTPException(409, "Search for the item first, then confirm it with the person.")
                     shown, now = OFFERED.get((pid, prod_id)), q("select price from products where id=%s", (prod_id,), one=True)
-                    if now and isinstance(shown, Decimal) and now["price"] != shown:  # they said yes to one price: never charge another
+                    if now and isinstance(shown, Decimal) and now["price"] != shown:  # they said yes to one price, never charge a different one
                         OFFERED[(pid, prod_id)] = now["price"]
                         raise HTTPException(409, f"The price changed from ${shown:.2f} to ${now['price']:.2f}. Tell the person the new price and ask again.")
                     if not agent.confirmed(message): raise HTTPException(409, "The person hasn't said yes yet. Tell them the item, store and price, and ask if they want it.")
@@ -767,7 +768,7 @@ def run_agent(pid, message, history=None, image_b64=None):
         msgs.append({"role": "user", "content": out})
     return done("I'm still working on that. Tell me a bit more about what you'd like.")
 
-# ---------- Auth: signed, expiring bearer tokens (stdlib only; fails closed without SECRET_KEY) ----------
+# Auth
 SECRET = os.environ["SECRET_KEY"].encode()
 if len(SECRET) < 16: raise RuntimeError("SECRET_KEY must be a long random string")
 def _sign(p): return hmac.new(SECRET, p.encode(), hashlib.sha256).hexdigest()
@@ -789,9 +790,9 @@ def current_user(authorization: str = Header(default="")) -> int:
 def deny(): raise HTTPException(403, "Not allowed.")
 def own(uid, pid):
     if uid != pid: deny()
-def can(uid, pid):  # the person themselves, or their guardian
+def can(uid, pid):  # the person themselves or their guardian
     if uid != pid and not q("select 1 from profiles where id=%s and guardian_id=%s", (pid, uid), one=True): deny()
-def manage(uid, pid):  # the guardian, or an adult managing their own account; kids can never edit their rules
+def manage(uid, pid):  # the guardian, or an adult managing their own account. kids can never edit their rules
     if not q("select 1 from profiles where id=%s and (guardian_id=%s or (id=%s and role='adult'))", (pid, uid, uid), one=True): deny()
 
 def hash_pw(pw):
@@ -800,17 +801,17 @@ def hash_pw(pw):
 
 def check_pw(pw, stored):
     if not stored: return False
-    if not stored.startswith("scrypt$"): return hmac.compare_digest(pw, stored)  # legacy demo seed; upgraded on first login
+    if not stored.startswith("scrypt$"): return hmac.compare_digest(pw, stored)  # old demo seed, gets upgraded on first login
     _, salt, h = stored.split("$")
     return hmac.compare_digest(hashlib.scrypt(pw.encode(), salt=bytes.fromhex(salt), n=2**14, r=8, p=1).hex(), h)
 
 COLS = "p.id,p.name,p.role,p.guardian_id,p.balance,p.coaching,p.frozen,p.interests,p.allowance,p.allowance_next"  # never select the password hash
 _GOALJ = """json_build_object('id',g.id,'name',g.name,'target',g.target,'saved',g.saved,'bonus_pct',g.bonus_pct,'bonus',round(g.target*g.bonus_pct/100,2),'watch',g.watch_product_id,'watch_name',(select name from products where id=g.watch_product_id),'emoji',(select emoji from products where id=g.watch_product_id),'watch_price',g.watch_price,'buy_below',g.buy_below)
          """
-GOAL = f"""(select {_GOALJ} from goals g where g.child_id=p.id and g.status in ('active','paying') order by g.id limit 1) as goal"""  # the oldest open goal
+GOAL = f"""(select {_GOALJ} from goals g where g.child_id=p.id and g.status in ('active','paying') order by g.id limit 1) as goal"""  # oldest open goal
 GOALS = f"""coalesce((select json_agg({_GOALJ} order by g.id) from goals g where g.child_id=p.id and g.status in ('active','paying')), '[]'::json) as goals"""
 
-# ---------- API ----------
+# API
 class Login(BaseModel): name: str; secret: str
 class Reg(BaseModel):
     name: str = Field(min_length=1, max_length=40); secret: str = Field(min_length=4, max_length=100); guardian_id: int | None = None
@@ -850,7 +851,7 @@ def register(r: Reg, authorization: str = Header(default="")):
               (r.name, role, r.guardian_id, role == "child", hash_pw(r.secret)), one=True)
     except psycopg.errors.UniqueViolation:
         raise HTTPException(409, "That name is taken.")
-    base = (500, 1000, 200) if role == "adult" else (25, 40, 15)  # a guardian can set a child's limits while creating the profile
+    base = (500, 1000, 200) if role == "adult" else (25, 40, 15)  # a guardian can set the kid's limits while creating the profile
     caps = [D(v if v is not None else d) for v, d in zip((r.per_purchase_cap, r.weekly_budget, r.approval_threshold), base)]
     stores = r.allowed_stores if r.allowed_stores is not None else ["Pixel Games", "Toy Barn"] + (["Gadget Hub"] if role == "adult" else [])
     q("insert into rules values(%s,%s,%s,%s,%s)", (p["id"], *caps, stores))
@@ -885,18 +886,18 @@ def purchase(b: Buy, uid: int = Depends(current_user)):
 def chat(c: Chat, bg: BackgroundTasks, uid: int = Depends(current_user)):
     own(uid, c.profile_id); throttle(uid)
     if not c.message.strip() and not c.image_b64: raise HTTPException(422, "Say something or add a photo.")
-    text, picks, order, missions = run_agent(uid, c.message, None, c.image_b64)  # c.history is ignored: Penny's memory is kept here, so the browser can't rewrite it
-    for m in missions: bg.add_task(plan_mission, m)  # runs right after the reply is sent
+    text, picks, order, missions = run_agent(uid, c.message, None, c.image_b64)  # ignoring c.history on purpose, memory is kept on the server so the browser can't rewrite it
+    for m in missions: bg.add_task(plan_mission, m)  # runs right after the reply goes out
     return {"reply": text, "picks": picks, "order": order, "missions": len(missions)}
 
 @app.get("/chat/history")
 def chat_history(uid: int = Depends(current_user)):
-    """The last day of this person's chat with Penny, so the screen looks the same after a reload."""
+    """last day of this person's chat with Penny so the screen looks the same after a reload"""
     rows = q("""select role, content, picks, order_id, created_at > now() - interval '2 hours' as fresh from chat_messages
                 where profile_id=%s and created_at > now() - interval '24 hours' order by id desc limit 20""", (uid,))[::-1]
     out = []
     for r in rows:
-        if r["fresh"]:  # store cards shown recently can be opened again
+        if r["fresh"]:  # store cards from recent chats can be opened again
             for o in r["picks"] or []:
                 if isinstance(o, dict) and o.get("url"):
                     with _lock: OFFERS[(uid, o["url"])] = {"title": o.get("title"), "store": o.get("store"), "price": o.get("price")}
@@ -923,7 +924,7 @@ def open_link(l: Link, uid: int = Depends(current_user)):
     own(uid, l.profile_id)
     with _lock: o = OFFERS.get((uid, l.url))
     if not o: raise HTTPException(404, "Search for this item first.")
-    if o.get("price") is None:  # a link to a store's own search page: there is no price to check and nothing is bought here
+    if o.get("price") is None:  # link to a store's own search page: no price to check and nothing is bought here
         log(uid, "link", f"Opened {o['store']} to look for {o['title']}")
         return {"status": "open", "url": l.url}
     verdict, why = check_rules(uid, o, partner=False)
@@ -938,7 +939,7 @@ def open_link(l: Link, uid: int = Depends(current_user)):
 ALERT_SQL = """select a.id, a.title, a.body, a.next_steps, a.created_at, a.needs_action, a.handled_at, a.goal_id, g.status as goal_status, g.bonus_pct as goal_pct, g.target as goal_target,
               coalesce(g.paid_bonus, round(g.target*g.bonus_pct/100,2)) as goal_bonus
               from alerts a left join goals g on g.id=a.goal_id
-              where a.profile_id=%s and (a.handled_at is null or a.handled_at > now() - interval '1 day') order by a.id desc limit 30"""  # dealt with = gone a day later
+              where a.profile_id=%s and (a.handled_at is null or a.handled_at > now() - interval '1 day') order by a.id desc limit 30"""  # handled = gone a day later
 
 @app.get("/alerts/{pid}")
 def alerts(pid: int, uid: int = Depends(current_user)):
@@ -947,7 +948,7 @@ def alerts(pid: int, uid: int = Depends(current_user)):
 
 @app.get("/inbox")
 def inbox(uid: int = Depends(current_user)):
-    """Everything on the Alerts tab in one call. Things that need a person come first; once dealt with they stay for a day, then leave."""
+    """everything on the Alerts tab in one call. things that need a person come first, handled ones stay a day then leave"""
     adult = q("select role from profiles where id=%s", (uid,), one=True)["role"] == "adult"
     props = q("select id, child_id, kind, title, body, data, trace, created_at, status, decided_at from proposals where profile_id=%s and (status='open' or decided_at > now() - interval '1 day') order by id desc limit 30", (uid,))
     approvals = activity = []
@@ -962,12 +963,12 @@ class Seen(BaseModel): upto: int
 
 @app.post("/alerts/seen")
 def alerts_seen(s: Seen, uid: int = Depends(current_user)):
-    """The person has looked at the plain notes. They leave a day from now. Notes that ask for something wait until it's done."""
+    """person has looked at the plain notes, so they leave a day from now. notes that ask for something wait until it's done"""
     q("update alerts set handled_at=now() where profile_id=%s and id <= %s and handled_at is null and not needs_action", (uid, s.upto))
     return {"ok": True}
 
-# ---------- Push notifications (Web Push: phones and computers) ----------
-PUSH_HOSTS = ("fcm.googleapis.com", "push.services.mozilla.com", "push.apple.com", "notify.windows.com")  # only the browsers' own push services: the server never posts to an arbitrary address
+# Push notifications
+PUSH_HOSTS = ("fcm.googleapis.com", "push.services.mozilla.com", "push.apple.com", "notify.windows.com")  # only the browsers' own push services, the server never posts to an arbitrary address
 class Sub(BaseModel): endpoint: str = Field(max_length=1000); p256dh: str = Field(max_length=200); auth: str = Field(max_length=100)
 class Unsub(BaseModel): endpoint: str = Field(max_length=1000)
 
@@ -1008,7 +1009,7 @@ def approvals(gid: int, uid: int = Depends(current_user)):
 @app.post("/approvals/{pid}/{action}")
 def decide(pid: int, action: str, uid: int = Depends(current_user)):
     if action not in ("approve", "decline"): raise HTTPException(422, "Unknown action.")
-    # claim atomically so a double tap can never charge twice
+    # claim it atomically so a double tap can't charge twice
     pu = q("""update purchases set status='processing', decided_at=now() where id=%s and status='pending'
               and profile_id in (select id from profiles where guardian_id=%s) returning *""", (pid, uid), one=True)
     if not pu: raise HTTPException(404, "No pending request.")
@@ -1054,16 +1055,16 @@ def set_allowance(pid: int, a: Allowance, uid: int = Depends(current_user)):
 
 @app.post("/goals")
 def new_goal(g: GoalIn, uid: int = Depends(current_user)):
-    can(uid, g.child_id)  # the child, or their guardian
+    can(uid, g.child_id)  # the kid, or their guardian
     if not q("select 1 from profiles where id=%s and role='child'", (g.child_id,), one=True): raise HTTPException(422, "Goals are for kids.")
-    if uid != g.child_id:  # a grown-up (can() let them through): a name the child already has only sets that goal's bonus; a new name starts another goal
+    if uid != g.child_id:  # a grown-up (can() lets them through): a name the kid already has only sets that goal's bonus, a new name starts another goal
         same = bonus_on_existing(g.child_id, g.name, g.percent)
         if same: return same
     return create_goal(g.child_id, g.name, g.target, uid, g.percent)
 
 @app.post("/savings")
 def save_money(d: Deposit, uid: int = Depends(current_user)):
-    own(uid, d.profile_id)  # savings are the child's own choice: nobody else moves this money
+    own(uid, d.profile_id)  # savings are the kid's own choice, nobody else moves this money
     return deposit(uid, d.amount, d.goal_id)
 
 @app.post("/goals/{gid}/bonus")
@@ -1078,7 +1079,7 @@ def withdraw_savings(d: Deposit, uid: int = Depends(current_user)):
     return take_back(uid, d.amount, d.goal_id)
 
 def credit_order(oid, uid=None):
-    """Capture an approved PayPal order exactly once and add its money to the guardian's balance. Safe to call twice."""
+    """captures an approved PayPal order exactly once and adds the money to the guardian's balance. safe to call twice"""
     row = q("update pay_orders set status='capturing' where order_id=%s and status='created' and (%s::int is null or profile_id=%s) returning profile_id, amount", (oid, uid, uid), one=True)
     if not row:
         done = q("select status from pay_orders where order_id=%s and (%s::int is null or profile_id=%s)", (oid, uid, uid), one=True)
@@ -1087,7 +1088,7 @@ def credit_order(oid, uid=None):
     try:
         res = paypal.capture_order(oid, request_id=f"capture-{oid}")
     except paypal.PayPalError:
-        q("update pay_orders set status='created' where order_id=%s", (oid,))  # not approved yet, or PayPal is busy: try again
+        q("update pay_orders set status='created' where order_id=%s", (oid,))  # not approved yet or PayPal is busy, try again
         raise HTTPException(502, "We couldn't confirm the payment yet. If you approved it, try again in a moment.")
     if not res["ok"] or (res["amount"] is not None and res["amount"] != row["amount"]):
         q("update pay_orders set status='failed' where order_id=%s", (oid,))
@@ -1101,14 +1102,14 @@ def credit_order(oid, uid=None):
 ORDER_ID = re.compile(r"^[A-Za-z0-9_-]{3,64}$")
 
 def topup_list(pid):
-    """A grown-up's own recent PayPal top-ups, from our records."""
+    """a grown-up's own recent PayPal top-ups, from our records"""
     rows = q("select order_id, amount, status, created_at from pay_orders where profile_id=%s order by created_at desc limit 5", (pid,))
     return {"topups": [{"order_id": r["order_id"], "amount": r["amount"], "app_status": r["status"], "started": r["created_at"].strftime("%Y-%m-%d"), **refund_facts(r["order_id"])} for r in rows]} if rows \
         else {"topups": [], "note": "No PayPal top-ups yet."}
 
 def topup_lookup(pid, order_id=None):
-    """Check one of THIS person's own top-ups with PayPal. The order must be in their pay_orders rows before PayPal is asked,
-    because the PayPal account is shared by every family. Asks PayPal's MCP server first, then the PayPal API, then falls back to our own record."""
+    """checks one of THIS person's top-ups with PayPal. the order has to be in their pay_orders rows before PayPal is asked,
+    because the PayPal account is shared across every family. tries the MCP server, then the PayPal API, then falls back to our own record"""
     oid = str(order_id or "").strip()
     if oid and not ORDER_ID.match(oid): raise HTTPException(422, "That doesn't look like a PayPal order id.")
     cols = "select order_id, amount, status, created_at from pay_orders where profile_id=%s"
@@ -1134,14 +1135,14 @@ def topup_lookup(pid, order_id=None):
         out["note"] = "PayPal shows this as completed but the app hasn't added the money yet. Suggest checking again in a minute."
     return out
 
-# ---------- Refunds: unspent top-up money goes back to the PayPal account it came from ----------
-# Penny can only FILE a request (a proposal). Nothing moves until the grown-up taps the button, and then plain code does the rest:
-# check the rules, take the money out of the balance first, ask PayPal with a retry-safe request id, and put the money back if PayPal says no.
+# Refunds
+# Penny can only FILE a request (a proposal). nothing moves until the grown-up taps the button, then plain code does the rest:
+# check the rules, take the money out of the balance first, ask PayPal with a retry-safe request id, put the money back if PayPal says no
 REFUND_DAYS = 180
 CENT = Decimal("0.01")
 
 def refund_facts(oid):
-    """What has already gone back for one top-up, for the lookup tools. Only non-zero figures are included."""
+    """what has already gone back for one top-up, for the lookup tools. only non-zero figures"""
     rows = {r["status"]: r["t"] for r in q("select status, sum(amount) as t from refunds where order_id=%s group by status", (oid,))}
     out = {}
     if rows.get("refunded"): out["refunded"] = rows["refunded"]
@@ -1150,7 +1151,7 @@ def refund_facts(oid):
     return out
 
 def refundable(pid, oid):
-    """How much of one of THIS person's top-ups can still go back. Raises HTTPException with a plain reason when none can."""
+    """how much of this person's top-up can still go back. raises HTTPException with a plain reason if none can"""
     row = q("select order_id, amount, status, created_at, created_at < now() - %s::interval as too_old from pay_orders where order_id=%s and profile_id=%s",
             (f"{REFUND_DAYS} days", oid, pid), one=True)
     if not row: raise HTTPException(404, "I can't find that top-up on your account.")
@@ -1165,7 +1166,7 @@ def refundable(pid, oid):
     return {**row, "left": left, "balance": bal, "max": mx}
 
 def capture_info(oid):
-    """The payment behind a top-up, as PayPal sees it. Asks PayPal's MCP server first, then the PayPal API. Returns (capture, how we asked)."""
+    """the payment behind a top-up as PayPal sees it. MCP server first, then the API. returns (capture, how i asked)"""
     if not paypal.configured():
         if not oid.startswith("SIM-"): raise HTTPException(409, "PayPal isn't connected right now, so I can't refund a real payment.")  # never pretend to refund real money
         return {"capture_id": "SIMCAP-" + oid[4:], "status": "COMPLETED", "amount": None, "refunded": Decimal(0)}, "demo mode"
@@ -1189,7 +1190,7 @@ def check_capture(cap, amt):
         raise HTTPException(409, f"PayPal only has ${max(cap['amount'] - cap['refunded'], 0):.2f} left to refund on that payment.")
 
 def refund_amount(raw, mx):
-    """The amount asked for, or the most that can go back. Anything odd is refused rather than guessed."""
+    """the amount asked for, or the max that can go back. anything odd gets refused instead of guessed"""
     if raw in (None, ""): return mx
     try: amt = Decimal(str(raw)).quantize(CENT, rounding=ROUND_DOWN)
     except Exception: raise HTTPException(422, "That isn't an amount I can refund.")
@@ -1198,7 +1199,7 @@ def refund_amount(raw, mx):
     return amt
 
 def refund_request(pid, order_id=None, amount=None):
-    """Penny's tool: file a refund request for the grown-up to approve. Moves no money."""
+    """Penny's tool: files a refund request for the grown-up to approve. moves no money"""
     oid = str(order_id or "").strip()
     if oid and not ORDER_ID.match(oid): raise HTTPException(422, "That doesn't look like a PayPal order id.")
     if not oid:
@@ -1222,7 +1223,7 @@ def refund_request(pid, order_id=None, amount=None):
             "note": "A refund request for this top-up is already waiting. Nothing has been sent yet."}
 
 def refund_applied(r):
-    """After PayPal said 'no' to a RETRIED refund, work out whether an earlier try actually went through. True, False (certainly not) or None (can't tell)."""
+    """PayPal said no to a RETRIED refund, so did an earlier try actually go through? True, False (definitely not) or None (can't tell)"""
     try:
         raw = None
         try: raw = paypal_mcp.get_order_json(r["order_id"])
@@ -1232,12 +1233,12 @@ def refund_applied(r):
         cap = paypal.order_capture(raw)
         if not cap: return None
         done = q("select coalesce(sum(amount),0) as t from refunds where order_id=%s and status='refunded' and id<>%s", (r["order_id"], r["id"]), one=True)["t"]
-        return False if cap["refunded"] < done + r["amount"] else None  # PayPal's total can't contain this refund yet
+        return False if cap["refunded"] < done + r["amount"] else None  # PayPal's total can't include this refund yet
     except paypal.PayPalError:
         return None
 
 def fail_refund(rid, why):
-    """PayPal said no: give the money back in the app, once. Both steps happen together or not at all."""
+    """PayPal said no: give the money back in the app, once. both steps happen together or not at all"""
     with pool.connection() as c, c.transaction():
         row = c.execute("update refunds set status='failed', reason=%s, done_at=now() where id=%s and status='refunding' returning profile_id, amount", (why, rid)).fetchone()
         if not row: return False
@@ -1245,10 +1246,10 @@ def fail_refund(rid, why):
     return True
 
 def settle_refund(rid, res, first):
-    """Record what PayPal answered. Never raises. Returns {"refund": "refunded"|"failed"|"processing", "message": ...}."""
+    """records what PayPal answered. never raises. returns {refund: refunded|failed|processing, message}"""
     r = q("select * from refunds where id=%s", (rid,), one=True)
     state, why = res["state"], res.get("why")
-    if state == "failed" and not first:  # an earlier try may have gone through even though this one was refused
+    if state == "failed" and not first:  # an earlier try may have gone through even though this one got refused
         applied = refund_applied(r)
         if applied: state, res = "refunded", {**res, "ref": None}
         elif applied is None: state = "unknown"
@@ -1262,13 +1263,13 @@ def settle_refund(rid, res, first):
     return {"refund": "processing", "message": f"PayPal hasn't confirmed the ${r['amount']:.2f} refund yet. It's safe: I'll keep trying and tell you when it's done."}
 
 def execute_refund(uid, oid, amount):
-    """The grown-up tapped the button. Re-check everything (time has passed), take the money out first, then ask PayPal."""
+    """grown-up tapped the button. re-check everything since time has passed, take the money out first, then ask PayPal"""
     amt = D(amount)
     r = refundable(uid, oid)
     if amt > r["max"]: raise HTTPException(409, f"Things have changed: the most that can go back now is ${r['max']:.2f}.")
     cap, _ = capture_info(oid)
     check_capture(cap, amt)
-    with pool.connection() as c, c.transaction():  # lock the top-up, so two taps at once can't refund more than was paid
+    with pool.connection() as c, c.transaction():  # lock the top-up so two taps at once can't refund more than was paid
         o = c.execute("select amount, status from pay_orders where order_id=%s and profile_id=%s for update", (oid, uid)).fetchone()
         used = c.execute("select coalesce(sum(amount),0) as t from refunds where order_id=%s and status in ('refunding','refunded','review')", (oid,)).fetchone()["t"]
         if not o or o["status"] != "captured" or o["amount"] - used < amt: raise HTTPException(409, "That top-up has already been refunded.")
@@ -1276,11 +1277,11 @@ def execute_refund(uid, oid, amount):
             raise HTTPException(409, "Your balance no longer covers that.")
         rid = c.execute("insert into refunds(profile_id, order_id, capture_id, amount) values(%s,%s,%s,%s) returning id", (uid, oid, cap["capture_id"], amt)).fetchone()["id"]
     out = settle_refund(rid, paypal.refund_capture(cap["capture_id"], amt, "Refund of your Stash top-up", f"stash-refund-{rid}", f"stash-refund-{rid}"), first=True)
-    if out["refund"] == "failed": raise HTTPException(422, out["message"])  # the proposal reopens, and nothing was taken
+    if out["refund"] == "failed": raise HTTPException(422, out["message"])  # the proposal reopens and nothing was taken
     return out
 
 def sweep_refunds():
-    """Finish refunds PayPal never answered: ask again with the same request id (PayPal never refunds twice for it). After a day, hand it to a person."""
+    """finishes refunds PayPal never answered: ask again with the same request id (PayPal won't refund twice for it). after a day it goes to a person"""
     n = 0
     for r in q("update refunds set tried_at=now(), attempts=attempts+1 where status='refunding' and tried_at < now() - interval '2 minutes' returning *, created_at < now() - interval '1 day' as stale"):
         n += 1
@@ -1308,19 +1309,19 @@ def funds_create(f: Funds, uid: int = Depends(current_user)):
 def funds_capture(c: Capture, uid: int = Depends(current_user)):
     return {"ok": True, "status": credit_order(c.order_id, uid)}
 
-@app.post("/webhooks/paypal")  # PayPal calls this when a buyer approves, so the money still arrives if they close the tab
+@app.post("/webhooks/paypal")  # PayPal calls this when a buyer approves, so the money still lands if they close the tab
 async def paypal_webhook(request: Request):
     event = await request.json()
     ok = await asyncio.to_thread(paypal.verify_webhook, {k.lower(): v for k, v in request.headers.items()}, event)
     if not ok: raise HTTPException(400, "Bad signature")
     if event.get("event_type") == "CHECKOUT.ORDER.APPROVED":
         try: await asyncio.to_thread(credit_order, (event.get("resource") or {}).get("id"))
-        except HTTPException: pass  # unknown or already handled: acknowledge anyway
+        except HTTPException: pass  # unknown or already handled, acknowledge anyway
     return {"ok": True}
 
 @app.post("/orders/{oid}/cancel")
 def cancel_order_route(oid: int, uid: int = Depends(current_user)):
-    """The Cancel button on an order card: the person who bought it, or their guardian."""
+    """the Cancel button on an order card: the buyer or their guardian"""
     throttle(f"cancel:{uid}", limit=10, window=300)
     pu = q("select profile_id from purchases where id=%s", (oid,), one=True)
     if not pu: raise HTTPException(404, "I can't find that order.")
@@ -1339,7 +1340,7 @@ def health():
 
 @app.post("/goals/{gid}/cancel")
 def cancel_goal(gid: int, uid: int = Depends(current_user)):
-    with plock(uid):  # only the child can cancel; the saved money goes back to the wallet, with no bonus
+    with plock(uid):  # only the kid can cancel. saved money goes back to the wallet, no bonus
         g = q("update goals set status='cancelled' where id=%s and child_id=%s and status='active' returning *", (gid, uid), one=True)
         if not g: raise HTTPException(404, "No goal to cancel.")
         q("update profiles set balance=balance+%s where id=%s", (g["saved"], uid))
@@ -1381,7 +1382,7 @@ def set_watch(gid: int, w: Watch, uid: int = Depends(current_user)):
         raise HTTPException(404, "There's no item being watched for this goal.")
     return {"ok": True}
 
-@app.post("/internal/partner-event")  # what a partner store's webhook would call (secured with the cron key in this MVP)
+@app.post("/internal/partner-event")  # what a partner store's webhook would call (secured with the cron key for now)
 def partner_event(e: PartnerEvent, x_cron_key: str = Header(default="")):
     if not cron_ok(x_cron_key): raise HTTPException(403, "Forbidden")
     return {"proposal": handle_partner_event(e.purchase_id, e.event)}

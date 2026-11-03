@@ -1,9 +1,8 @@
-"""One Postgres for every test file, set up before `main` is first imported.
+"""one Postgres for every test file, set up before `main` is first imported.
 
-By default it is an embedded one (pgserver, from requirements-dev.txt). If pgserver won't install on your machine, set
-TEST_DATABASE_URL to an EMPTY, throwaway Postgres database instead (local Postgres, Docker, or a spare Supabase project).
-The app's tables in that database are dropped and recreated on every run, so never point it at your real data.
-"""
+by default it's an embedded one (pgserver, from requirements-dev.txt). if pgserver won't install on your machine set
+TEST_DATABASE_URL to an EMPTY throwaway Postgres database instead (local Postgres, Docker, or a spare Supabase project).
+the app's tables in that database get dropped and recreated on every run, so never point it at real data"""
 import os, tempfile
 import psycopg
 from dotenv import dotenv_values
@@ -16,7 +15,7 @@ if _test_url:
         raise RuntimeError("TEST_DATABASE_URL is the same as DATABASE_URL. The tests wipe their database, so use a separate, empty one.")
     _uri = _test_url
     with psycopg.connect(_uri, autocommit=True) as _c:
-        _c.execute("drop table if exists refunds, push_subs, missions, proposals, pay_orders, alerts, audit, purchases, goals, rules, products, profiles cascade")
+        _c.execute("drop table if exists chat_messages, refunds, push_subs, missions, proposals, pay_orders, alerts, audit, purchases, goals, rules, products, profiles cascade")
 else:
     import pgserver
     _srv = pgserver.get_server(tempfile.mkdtemp())
@@ -31,7 +30,7 @@ import pytest
 
 @pytest.fixture(scope="session")
 def client():
-    """One running app for the whole test session (its connection pool can't be reopened once closed)."""
+    """one running app for the whole test session (its connection pool can't be reopened once closed)"""
     from fastapi.testclient import TestClient
     import main
     with TestClient(main.app) as c:

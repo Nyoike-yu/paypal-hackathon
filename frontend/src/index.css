@@ -56,7 +56,7 @@ ol.trace{margin:8px 0 0;padding-left:22px;color:var(--mute);font-size:.9rem}.sug
 h3.sub{font-size:1rem;margin:8px 0 0;color:var(--mute);font-weight:900}
 .prompt{border-color:var(--blue)}
 
-/* ---- v2: mascot, semantic color, hierarchy, motion, desktop frame ---- */
+/* v2: mascot, semantic color, hierarchy, motion, desktop frame */
 :root{--ok:#1B7F4B;--warn:#B45309;--bad:#C62828;--coin:#F5B301}
 @media (prefers-color-scheme:dark){:root{--ok:#4ADE80;--warn:#FBBF24;--bad:#FF8A80}}
 body{font-variant-numeric:tabular-nums}h1,h2,.btn,.alt{font-weight:800}.big{font-weight:800;letter-spacing:-.02em}.bal{padding:8px 2px}
@@ -76,7 +76,7 @@ body{font-variant-numeric:tabular-nums}h1,h2,.btn,.alt{font-weight:800}.big{font
 @media (min-width:700px){body{background:var(--line);padding:24px 0}.app{background:var(--bg);border-radius:32px;box-shadow:0 20px 60px rgba(11,42,91,.3);min-height:calc(100vh - 48px)}
 .tabs{bottom:24px;border-radius:0 0 32px 32px}.composer{bottom:calc(90px + env(safe-area-inset-bottom,0));background:transparent}.toast{bottom:104px}.app.chat .toast{bottom:174px}}
 
-/* ---- v2.1: product pick cards ---- */
+/* v2.1: product pick cards */
 .bubble.penny>*{min-width:0}
 .picks{display:flex;gap:10px;overflow-x:auto;scroll-snap-type:x mandatory;margin-top:8px;padding-bottom:6px}
 .pick2{flex:none;width:168px;scroll-snap-align:start;background:var(--card);color:var(--ink);border-radius:14px;padding:8px;display:flex;flex-direction:column;gap:2px}
@@ -85,7 +85,7 @@ body{font-variant-numeric:tabular-nums}h1,h2,.btn,.alt{font-weight:800}.big{font
 .pt{font-size:.9rem;line-height:1.25;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .pick2 .price{margin:2px 0}.pick2 button{margin-top:6px;min-height:44px}
 
-/* ---- v2.2: different moods. Kids: playful and big. Grown-ups: calm and dense ---- */
+/* v2.2: different moods. kids: playful and big, grown-ups: calm and dense */
 .app.kid .card{border-radius:26px}.app.kid .btn,.app.kid .alt{min-height:56px;border-radius:18px}
 .savings{padding:4px 0}.pigwrap.lg{width:fit-content;margin:0 auto}.pigwrap.lg .piggy{width:min(250px,64vw)}
 .dream{position:absolute;right:-10px;top:-16px;width:68px;height:68px;border-radius:50%;background:var(--card);border:3px solid var(--blue);display:grid;place-items:center;font-size:2rem;font-weight:800;color:var(--bt);transition:filter .6s,opacity .6s}

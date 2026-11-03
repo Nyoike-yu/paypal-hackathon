@@ -1,4 +1,4 @@
-"""A stand-in for `npx @paypal/mcp --tools=orders.get`, for tests. Speaks the real MCP protocol over stdio and offers get_order(id)."""
+"""stand-in for `npx @paypal/mcp --tools=orders.get`, for tests. speaks the real MCP protocol over stdio and offers get_order(id)"""
 import json, sys
 try:
     from mcp.server.fastmcp import FastMCP

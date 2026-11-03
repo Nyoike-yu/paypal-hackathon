@@ -1,4 +1,4 @@
-"""Run once: python gen_vapid.py  — prints the three lines to paste into your .env (keep the private key secret)."""
+"""run once: python gen_vapid.py. prints the three lines to paste into .env (keep the private key secret)"""
 import base64
 from cryptography.hazmat.primitives import serialization
 from py_vapid import Vapid
