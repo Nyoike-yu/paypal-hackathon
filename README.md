@@ -14,7 +14,7 @@ Kids learn very little about financial trade-offs when spending is just an invis
 * **Children** manage their spending wallet and savings pot, shop via natural language or photo attachments with **Penny** (powered by **Google Gemini**), and learn budgeting within hard guardrails enforced strictly by the server.
 * **Merchant payouts, top-up refunds, and read-only order verification** run through **PayPal REST APIs** and **PayPal's official MCP server (`@paypal/mcp`)**.
 
-*(Note: "Stash" is a working name stored in a single frontend constant and login screen string.)*
+
 
 ---
 
